@@ -1,32 +1,50 @@
 
 #include <Wire.h>
-#include <Adafruit_NeoPixel.h>
 #include "maze_runner_lib.h"
 
-#define I2C_ADDRESS 0x88
+// ATtiny (megaTinyCore) uses its own bundled NeoPixel driver, tinyNeoPixel_static, which
+// differs from Adafruit_NeoPixel in three ways: the class name, the caller supplies the
+// pixel buffer (3 bytes per LED), and there is no begin() (set pinMode yourself).
+// [env:tiny] sets -D USE_TINYNEOPIXEL in platformio.ini.
+#if defined(USE_TINYNEOPIXEL)
+  #include <tinyNeoPixel_static.h>
+  using NeoPixel = tinyNeoPixel;
+#else
+  #include <Adafruit_NeoPixel.h>
+  using NeoPixel = Adafruit_NeoPixel;
+#endif
+
+#define I2C_ADDRESS 0x68
 
 const int MAZE_DELAY_MS = 50;
-const uint32_t BLACK = Adafruit_NeoPixel::Color(0x00, 0x00, 0x00);
-const uint32_t RED = Adafruit_NeoPixel::Color(0xFF, 0x00, 0x00);
-const uint32_t ORANGE = Adafruit_NeoPixel::Color(0xCC, 0x44, 0x00);
-const uint32_t YELLOW = Adafruit_NeoPixel::Color(0xFF, 0xFF, 0x00);
-const uint32_t YELLOWGREEN = Adafruit_NeoPixel::Color(0xCC, 0xFF, 0x00);
-const uint32_t GREEN = Adafruit_NeoPixel::Color(0x00, 0xFF, 0x00);
-const uint32_t BLUE = Adafruit_NeoPixel::Color(0x00, 0x00, 0x77);
-const uint32_t PURPLE = Adafruit_NeoPixel::Color(0x77, 0x00, 0x77);
+const uint32_t BLACK = NeoPixel::Color(0x00, 0x00, 0x00);
+const uint32_t RED = NeoPixel::Color(0xFF, 0x00, 0x00);
+const uint32_t ORANGE = NeoPixel::Color(0xCC, 0x44, 0x00);
+const uint32_t YELLOW = NeoPixel::Color(0xFF, 0xFF, 0x00);
+const uint32_t YELLOWGREEN = NeoPixel::Color(0xCC, 0xFF, 0x00);
+const uint32_t GREEN = NeoPixel::Color(0x00, 0xFF, 0x00);
+const uint32_t BLUE = NeoPixel::Color(0x00, 0x00, 0x77);
+const uint32_t PURPLE = NeoPixel::Color(0x77, 0x00, 0x77);
+static const uint8_t BRIGHTNESS = 4;
 static const uint8_t LED_IN_PIN = 6;
 static const int WIDTH = MAZE_RUNNER_WIDTH;
 static const int HEIGHT = MAZE_RUNNER_HEIGHT;
 
-// Maze generation options.
-const MazeGenerationOptions mazeOptions = {
+// Maze options.
+const MazeOptions mazeOptions = {
   true,  // outerWalls
   true,  // preventDiagonalTouching
   false, // perfectVision
-  Adafruit_NeoPixel::Color(0x04, 0x04, 0x04) // visitedColor
+  NeoPixel::Color(0x04, 0x04, 0x04), // visitedColor
+  true   // sentryPatrol
 };
 
-Adafruit_NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800);
+#if defined(USE_TINYNEOPIXEL)
+static uint8_t pixelBuffer[WIDTH * HEIGHT * 3];
+NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800, pixelBuffer);
+#else
+NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800);
+#endif
 volatile bool display = true;
 
 void drawPixel(int x, int y, uint32_t color)
@@ -63,11 +81,17 @@ MazeRunner mazeRunner(
 
 void setup()
 {
+  randomSeed(analogRead(A0)); 
+
   Wire.begin(I2C_ADDRESS);
   Wire.onReceive(handleOnReceive);
 
+#if defined(USE_TINYNEOPIXEL)
+  pinMode(LED_IN_PIN, OUTPUT); // tinyNeoPixel_static has no begin()
+#else
   matrix.begin();
-  matrix.setBrightness(7);
+#endif
+  matrix.setBrightness(BRIGHTNESS);
   matrix.show();
 
   mazeRunner.init();
