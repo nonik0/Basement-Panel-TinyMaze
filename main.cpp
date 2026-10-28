@@ -41,14 +41,19 @@ static const uint8_t LED_IN_PIN = 6;
 static const int WIDTH = MAZE_RUNNER_WIDTH;
 static const int HEIGHT = MAZE_RUNNER_HEIGHT;
 
-// Maze options.
-constexpr MazeOptions mazeOptions = {
-  true,  // outerWalls
-  true,  // preventDiagonalTouching
-  false, // perfectVision
-  rgb(0x04, 0x04, 0x04), // visitedColor
-  true   // sentryPatrol
-};
+// Maze options: anything not set here keeps its default (see MazeOptions in maze_runner_lib.h),
+// including the runner/sentry sense and speed, extra loops, and delays.
+constexpr MazeOptions makeMazeOptions()
+{
+  MazeOptions o;
+  o.outerWalls = true;
+  o.preventDiagonalTouching = true;
+  o.perfectVision = false;
+  o.visitedColor = rgb(0x04, 0x04, 0x04);
+  o.sentryPatrol = true;
+  return o;
+}
+constexpr MazeOptions mazeOptions = makeMazeOptions();
 
 #if defined(USE_TINYNEOPIXEL)
 static uint8_t pixelBuffer[WIDTH * HEIGHT * 3];
