@@ -26,7 +26,11 @@ const uint32_t GREEN = NeoPixel::Color(0x00, 0xFF, 0x00);
 const uint32_t BLUE = NeoPixel::Color(0x00, 0x00, 0x77);
 const uint32_t PURPLE = NeoPixel::Color(0x77, 0x00, 0x77);
 static const uint8_t BRIGHTNESS = 4;
+#if defined(USE_TINYNEOPIXEL)
+static const uint8_t LED_IN_PIN = 16;
+#else
 static const uint8_t LED_IN_PIN = 6;
+#endif
 static const int WIDTH = MAZE_RUNNER_WIDTH;
 static const int HEIGHT = MAZE_RUNNER_HEIGHT;
 
@@ -41,7 +45,7 @@ const MazeOptions mazeOptions = {
 
 #if defined(USE_TINYNEOPIXEL)
 static uint8_t pixelBuffer[WIDTH * HEIGHT * 3];
-NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800, pixelBuffer);
+NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB, pixelBuffer);
 #else
 NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800);
 #endif
@@ -56,17 +60,6 @@ void setStatus(uint32_t color)
 {
 }
 
-void handleOnReceive(int bytesReceived)
-{
-  if (bytesReceived < 2) return;
-
-  uint8_t command = Wire.read();
-  if (command == 0x00 && Wire.available())
-    display = Wire.read() != 0;
-
-  while (Wire.available()) Wire.read();
-}
-
 MazeRunner mazeRunner(
   WIDTH,
   HEIGHT,
@@ -79,6 +72,17 @@ MazeRunner mazeRunner(
   setStatus,
   mazeOptions);
 
+void handleOnReceive(int bytesReceived)
+{
+  if (bytesReceived < 2) return;
+
+  uint8_t command = Wire.read();
+  if (command == 0x00 && Wire.available())
+    display = Wire.read() != 0;
+
+  while (Wire.available()) Wire.read();
+}
+
 void setup()
 {
   randomSeed(analogRead(A0)); 
@@ -88,10 +92,10 @@ void setup()
 
 #if defined(USE_TINYNEOPIXEL)
   pinMode(LED_IN_PIN, OUTPUT); // tinyNeoPixel_static has no begin()
-#else
-  matrix.begin();
 #endif
+  matrix.begin();
   matrix.setBrightness(BRIGHTNESS);
+  matrix.clear();
   matrix.show();
 
   mazeRunner.init();

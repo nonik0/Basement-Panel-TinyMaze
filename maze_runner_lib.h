@@ -21,7 +21,7 @@
 #define MAZE_RUNNER_WIDTH 16
 #endif
 #ifndef MAZE_RUNNER_HEIGHT
-#define MAZE_RUNNER_HEIGHT 16
+#define MAZE_RUNNER_HEIGHT 15
 #endif
 
 #if MAZE_RUNNER_WIDTH < 1 || MAZE_RUNNER_HEIGHT < 1 || MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT > 256
@@ -29,7 +29,7 @@
 #endif
 
 // Fixed-size implementation for small AVR targets. Cell indexes are one byte.
-static const uint16_t MAZE_MAX_CELLS = MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT;
+static const uint16_t MAZE_MAX_CELLS = MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT; // TODO: save memory by reducing this
 static const uint16_t MAZE_BITSET_BYTES = (MAZE_MAX_CELLS + 7) / 8;
 
 struct MazeOptions
@@ -759,51 +759,51 @@ inline void MazeRunner::generateMaze()
 
   Location finish = decode(_runnerPath[pathSize - 1]);
 
-int removed = 0;
-maxCycles = 1000;
+  int removed = 0;
+  maxCycles = 1000;
 
-while (removed < _mazeExtraWallsToRemove && maxCycles-- > 0)
-{
-  int x = random(_width);
-  int y = random(_height);
-  Location loc = {x, y};
-
-  if (isCorridorWall(loc) &&
-      !(_options.preventDiagonalTouching && hasDiagonalOnlyNeighbor(loc)))
+  while (removed < _mazeExtraWallsToRemove && maxCycles-- > 0)
   {
-    setWall(x, y, false);
-    ++removed;
+    int x = random(_width);
+    int y = random(_height);
+    Location loc = {x, y};
+
+    if (isCorridorWall(loc) &&
+        !(_options.preventDiagonalTouching && hasDiagonalOnlyNeighbor(loc)))
+    {
+      setWall(x, y, false);
+      ++removed;
+    }
   }
-}
 
-if (removed < _mazeExtraWallsToRemove)
-  log_w("Failed to remove all extra corridor walls");
+  if (removed < _mazeExtraWallsToRemove)
+    log_w("Failed to remove all extra corridor walls");
 
-  // In outer-wall mode, turn the selected inner-edge finish into a perimeter exit.
-  if (_options.outerWalls)
-  {
-    _exitLoc = finish;
-    if (finish.y == 1) --_exitLoc.y;
-    else if (finish.y == _height - 2) ++_exitLoc.y;
-    else if (finish.x == 1) --_exitLoc.x;
-    else if (finish.x == _width - 2) ++_exitLoc.x;
+    // In outer-wall mode, turn the selected inner-edge finish into a perimeter exit.
+    if (_options.outerWalls)
+    {
+      _exitLoc = finish;
+      if (finish.y == 1) --_exitLoc.y;
+      else if (finish.y == _height - 2) ++_exitLoc.y;
+      else if (finish.x == 1) --_exitLoc.x;
+      else if (finish.x == _width - 2) ++_exitLoc.x;
+      else
+      {
+        log_e("Failed to place perimeter exit");
+        _exitLoc = NullLocation;
+        return;
+      }
+
+      setWall(_exitLoc.x, _exitLoc.y, false);
+    }
     else
     {
-      log_e("Failed to place perimeter exit");
-      _exitLoc = NullLocation;
-      return;
+      _exitLoc = finish;
     }
 
-    setWall(_exitLoc.x, _exitLoc.y, false);
-  }
-  else
-  {
-    _exitLoc = finish;
-  }
-
-  clearRunnerPath();
-  log_d("Maze generation complete; start (%d,%d), exit (%d,%d)",
-        _runnerLoc.x, _runnerLoc.y, _exitLoc.x, _exitLoc.y);
+    clearRunnerPath();
+    log_d("Maze generation complete; start (%d,%d), exit (%d,%d)",
+          _runnerLoc.x, _runnerLoc.y, _exitLoc.x, _exitLoc.y);
 }
 
 // inline void MazeRunner::placeRunner()
@@ -976,7 +976,7 @@ inline bool MazeRunner::findPathDfs(Location start, Location sentry, Location en
   if (!isInBounds(start) || !isInBounds(end)) return false;
 
   // Mark cells when pushed, so the bounded stack cannot grow beyond cell count.
-  uint8_t stackCell[MAZE_MAX_CELLS];
+  uint8_t *stackCell = outPath; // reuse out buffer to save memory
   uint8_t parent[MAZE_MAX_CELLS];
   uint8_t visited[MAZE_BITSET_BYTES] = {};
   uint16_t top = 0;
@@ -1045,7 +1045,7 @@ inline bool MazeRunner::findLongestPathBfs(Location start, Location sentry,
   outSize = 0;
   if (!isInBounds(start)) return false;
 
-  uint8_t queue[MAZE_MAX_CELLS];
+  uint8_t *queue = outPath; // reuse out buffer to save memory
   uint8_t parent[MAZE_MAX_CELLS];
   uint8_t visited[MAZE_BITSET_BYTES] = {};
   uint16_t head = 0, tail = 0;
@@ -1107,7 +1107,7 @@ inline bool MazeRunner::findNearestUnvisitedPath(Location start, uint8_t *outPat
   outSize = 0;
   if (!isInBounds(start)) return false;
 
-  uint8_t queue[MAZE_MAX_CELLS];
+  uint8_t *queue = outPath; // reuse out buffer to save memory
   uint8_t parent[MAZE_MAX_CELLS];
   uint8_t visited[MAZE_BITSET_BYTES] = {};
   uint16_t head = 0, tail = 0;
@@ -1205,20 +1205,19 @@ inline bool MazeRunner::isInnerEdgeCell(Location loc) const
 
 inline bool MazeRunner::isCorridorWall(Location loc) const
 {
-  if (!isInBounds(loc) || !isWall(loc)) return false;
+  // All four neighbors must be in bounds before calling isWall().
+  if (loc.x <= 0 || loc.x >= _width - 1 ||
+      loc.y <= 0 || loc.y >= _height - 1 ||
+      !isWall(loc))
+    return false;
 
-  Location left  = loc + Left;
-  Location right = loc + Right;
-  Location up    = loc + Up;
-  Location down  = loc + Down;
+  bool horizontal =
+      !isWall(loc + Left) && !isWall(loc + Right) &&
+       isWall(loc + Up)   &&  isWall(loc + Down);
 
-  bool horizontal = isInBounds(left) && isInBounds(right) &&
-                    !isWall(left) && !isWall(right) &&
-                    isWall(up) && isWall(down);
-
-  bool vertical = isInBounds(up) && isInBounds(down) &&
-                  !isWall(up) && !isWall(down) &&
-                  isWall(left) && isWall(right);
+  bool vertical =
+      !isWall(loc + Up)   && !isWall(loc + Down) &&
+       isWall(loc + Left) &&  isWall(loc + Right);
 
   return horizontal || vertical;
 }
