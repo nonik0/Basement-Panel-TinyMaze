@@ -157,6 +157,7 @@ private:
 
   // runner state
   Location _runnerLoc = NullLocation;
+  Location _runnerKnownSentryLoc = NullLocation;
   Location _runnerSpawnLoc = NullLocation;
   bool _runnerCaught = false;
   uint8_t _runnerCooldown = 0;
@@ -307,6 +308,7 @@ inline void MazeRunner::init()
 
   for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] = 0;
   // TODO hate how these are set manually here
+  _runnerKnownSentryLoc = NullLocation;
   _runnerCaught = false;
   _roundFrames = 0;
   generateMaze();
@@ -340,6 +342,7 @@ inline void MazeRunner::retryRound()
 {
   log_d("Retrying maze");
   _runnerCaught = false;
+  _runnerKnownSentryLoc = NullLocation;
   _runnerLoc = _runnerSpawnLoc;
   clearSearchPath();
   _runnerCooldown = 0;
@@ -405,58 +408,75 @@ inline bool MazeRunner::moveRunner()
 
   if (!_options.perfectVision)
   {
-    // Replan every step: a planned target may have come into sight, e.g. the end of a short
-    // dead end, and is no longer worth walking to.
     markSeen();
     _searchPathSize = 0;
   }
 
-  // Steps to the sentry, or 0 when it is farther than sentrySense (or inactive). The runner
-  // reacts within runnerSense; when sentrySense is larger, the sentry can see the runner first.
   const uint8_t sense = _options.runnerSense;
   const uint8_t lookout = sense > _options.sentrySense ? sense : _options.sentrySense;
   uint16_t sentryDistance = 0;
+
   if (_sentryActive)
   {
-    if (!findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation, lookout, sentryDistance))
+    if (!findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation,
+                  lookout, sentryDistance))
       sentryDistance = 0;
-    // That search used _searchPath as its queue, so the previous plan is gone either way.
+
     _searchPathSize = 0;
   }
 
-  // Flee to the farthest cell nearby, never stepping closer to the sentry than the runner already
-  // is: in a pocket, the farthest reachable cell can lie toward it.
-  auto flee = [&]() {
-    uint16_t reach = (uint16_t)sense + _options.runnerFear;
-    findPath(GoalFarthest, _runnerLoc, NullLocation, _sentryLoc, reach > 255 ? 255 : (uint8_t)reach,
-             _searchPathSize, (uint8_t)(sentryDistance - 1));
-  };
+  // Remember the sentry's location whenever the runner sees it.
+  const bool sentrySeen = sentryDistance > 0 && sentryDistance <= sense;
+  if (sentrySeen)
+    _runnerKnownSentryLoc = _sentryLoc;
 
-  // sense and flee if sentry is near
-  if (sentryDistance > 0 && sentryDistance <= sense) flee();
-  // plan if able
-  else if (_searchPathSize == 0)
+  // Measure distance to the last-known location, even when the sentry is no longer visible.
+  uint16_t knownSentryDistance = 0;
+  bool hasKnownSentry = _runnerKnownSentryLoc != NullLocation;
+
+  if (hasKnownSentry)
   {
-    // Plan around every cell from which the sentry would be sensed. Routing only around the
-    // sentry's own cell led the runner back into sensing range right after each flee step, so it
-    // dithered in place until caught.
-    Location sentry = _sentryActive ? _sentryLoc : NullLocation;
-    // If the exit is nearby, head for it instead of walking past to explore.
-    if (!findPath(GoalCell, _runnerLoc, _exitLoc, sentry, sense, _searchPathSize, sense))
+    if (!findPath(GoalCell, _runnerLoc, _runnerKnownSentryLoc, NullLocation,
+                  NoDepthLimit, knownSentryDistance))
     {
-      if (!_options.perfectVision)
-        findPath(GoalUnvisited, _runnerLoc, NullLocation, sentry, NoDepthLimit,
-                 _searchPathSize, sense);
-      if (_searchPathSize == 0)
-        findPath(GoalCell, _runnerLoc, _exitLoc, sentry, NoDepthLimit,
-                 _searchPathSize, sense);
+      _runnerKnownSentryLoc = NullLocation;
+      hasKnownSentry = false;
     }
-    // No route around the sentry: wait for it to move, unless it is close enough to have seen
-    // the runner. Waiting then lets it close in a step at a time, so back away instead.
-    if (_searchPathSize == 0 && sentryDistance > 0) flee();
+    _searchPathSize = 0;
   }
 
-  // move
+  // Keep fleeing until the sentry is unseen and runnerFear steps away.
+  const bool fleeing = sentrySeen ||
+    (hasKnownSentry && knownSentryDistance < _options.runnerFear);
+
+  if (fleeing && hasKnownSentry)
+  {
+    uint16_t reach = (uint16_t)sense + _options.runnerFear;
+    findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
+             reach > 255 ? 255 : (uint8_t)reach, _searchPathSize,
+             knownSentryDistance > 0 ? (uint8_t)(knownSentryDistance - 1) : 0);
+  }
+  else
+  {
+    // The sentry is no longer visible and far enough away; forget its location.
+    if (hasKnownSentry)
+      _runnerKnownSentryLoc = NullLocation;
+
+    // If the exit is nearby, head for it instead of walking past to explore.
+    if (!findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
+                  sense, _searchPathSize))
+    {
+      if (!_options.perfectVision)
+        findPath(GoalUnvisited, _runnerLoc, NullLocation, NullLocation,
+                 NoDepthLimit, _searchPathSize);
+
+      if (_searchPathSize == 0)
+        findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
+                 NoDepthLimit, _searchPathSize);
+    }
+  }
+
+  // Move
   Location next;
   if (popFrontPath(_searchPath, _searchPathSize, next))
   {
@@ -464,9 +484,11 @@ inline bool MazeRunner::moveRunner()
     _runnerLoc = next;
     if (!_options.perfectVision) markSeen();
     _runnerCooldown = _sentryActive ? _options.runnerSpeed : 0;
-    log_v("Moved runner from (%d,%d) to (%d,%d)", prev.x, prev.y, _runnerLoc.x, _runnerLoc.y);
+    log_v("Moved runner from (%d,%d) to (%d,%d)",
+          prev.x, prev.y, _runnerLoc.x, _runnerLoc.y);
     return true;
   }
+
   return false;
 }
 

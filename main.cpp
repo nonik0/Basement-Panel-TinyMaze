@@ -32,12 +32,14 @@ constexpr uint32_t YELLOWGREEN = rgb(0xCC, 0xFF, 0x00);
 constexpr uint32_t GREEN = rgb(0x00, 0xFF, 0x00);
 constexpr uint32_t BLUE = rgb(0x00, 0x00, 0x77);
 constexpr uint32_t PURPLE = rgb(0x77, 0x00, 0x77);
-static const uint8_t BRIGHTNESS = 5;
+static const uint8_t BRIGHTNESS = 4;
 #if defined(USE_TINYNEOPIXEL)
 static const uint8_t LED_IN_PIN = 16;
 #else
 static const uint8_t LED_IN_PIN = 6;
 #endif
+static const uint8_t STATUS_LED_PIN = 10;
+static const uint16_t STATUS_UPDATE_INTERVAL = 500; // milliseconds for status LED update interval
 static const int WIDTH = MAZE_RUNNER_WIDTH;
 static const int HEIGHT = MAZE_RUNNER_HEIGHT;
 
@@ -55,6 +57,13 @@ constexpr MazeOptions makeMazeOptions()
 }
 constexpr MazeOptions mazeOptions = makeMazeOptions();
 
+// i2c
+bool statusLedState = false;
+bool statusLedFirstBlink = false;
+uint8_t statusLedBlinks = 0; // number of extra short blinks after long "ACK" blink
+unsigned long lastStatusLedUpdate = 0;
+unsigned long statusLedUpdateInterval = STATUS_UPDATE_INTERVAL;
+
 #if defined(USE_TINYNEOPIXEL)
 static uint8_t pixelBuffer[WIDTH * HEIGHT * 3];
 NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB, pixelBuffer);
@@ -62,6 +71,7 @@ NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB, pixelBuffer);
 NeoPixel matrix(WIDTH * HEIGHT, LED_IN_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 volatile bool display = true;
+unsigned long lastMazeUpdate = 0;
 
 void drawPixel(int x, int y, uint32_t color)
 {
@@ -86,11 +96,21 @@ MazeRunner mazeRunner(
 
 void handleOnReceive(int bytesReceived)
 {
+  statusLedState = true;
+  digitalWrite(STATUS_LED_PIN, !statusLedState);
+  lastStatusLedUpdate = millis();
+  statusLedBlinks = 0;
+  statusLedFirstBlink = true;
+
   if (bytesReceived < 2) return;
 
   uint8_t command = Wire.read();
+  statusLedBlinks = command + 1; // use value to blink status LED
   if (command == 0x00 && Wire.available())
     display = Wire.read() != 0;
+  else {
+    statusLedBlinks = 10; // error
+  }
 
   while (Wire.available()) Wire.read();
 }
@@ -99,12 +119,15 @@ void setup()
 {
   randomSeed(analogRead(A0) ^ analogRead(A1) ^ analogRead(A2));
 
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, false);
+  #if defined(USE_TINYNEOPIXEL)
+  pinMode(LED_IN_PIN, OUTPUT);
+  #endif
+  
   Wire.begin(I2C_ADDRESS);
   Wire.onReceive(handleOnReceive);
 
-#if defined(USE_TINYNEOPIXEL)
-  pinMode(LED_IN_PIN, OUTPUT); // tinyNeoPixel_static has no begin()
-#endif
   matrix.begin();
   matrix.setBrightness(BRIGHTNESS);
   matrix.clear();
@@ -112,20 +135,54 @@ void setup()
 
   mazeRunner.init();
   matrix.show(); // init() now draws the initial maze.
+
+  delay(500);
+  digitalWrite(STATUS_LED_PIN, true);
 }
 
 void loop()
 {
+  // status LED indicates when I2C message is received, long blink first, then short blink count indicates status
+  if ((statusLedBlinks > 0 || statusLedState) && millis() - lastStatusLedUpdate > statusLedUpdateInterval)
+  {
+    statusLedState = !statusLedState;
+    digitalWrite(STATUS_LED_PIN, !statusLedState);
+    lastStatusLedUpdate = millis();
+
+    if (statusLedBlinks > 0)
+    {
+      statusLedBlinks -= statusLedState ? 1 : 0;
+      statusLedUpdateInterval = statusLedState ? (STATUS_UPDATE_INTERVAL >> 2) : (STATUS_UPDATE_INTERVAL >> 3);
+
+      // longer gap between first long blink and later short blinks
+      if (statusLedFirstBlink)
+      {
+        statusLedFirstBlink = false;
+        statusLedUpdateInterval = STATUS_UPDATE_INTERVAL >> 1;
+      }
+    }
+    else
+    {
+      statusLedUpdateInterval = STATUS_UPDATE_INTERVAL;
+    }
+  }
+
+  if (millis() - lastMazeUpdate < MAZE_DELAY_MS)
+  {
+    yield();
+    return;
+  }
+
   if (!display)
   {
     matrix.clear();
     matrix.show();
-    delay(MAZE_DELAY_MS);
+    lastMazeUpdate = millis();
     return;
   }
 
   if (mazeRunner.update())
     matrix.show();
 
-  delay(MAZE_DELAY_MS);
+  lastMazeUpdate = millis();
 }
