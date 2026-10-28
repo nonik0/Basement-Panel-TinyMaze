@@ -7,25 +7,32 @@
 // pixel buffer (3 bytes per LED), and there is no begin() (set pinMode yourself).
 // [env:tiny] sets -D USE_TINYNEOPIXEL in platformio.ini.
 #if defined(USE_TINYNEOPIXEL)
-  #include <tinyNeoPixel_static.h>
+  #include <tinyNeoPixel_Static.h>
   using NeoPixel = tinyNeoPixel;
 #else
   #include <Adafruit_NeoPixel.h>
   using NeoPixel = Adafruit_NeoPixel;
 #endif
 
-#define I2C_ADDRESS 0x68
+#define I2C_ADDRESS 0x14
 
 const int MAZE_DELAY_MS = 50;
-const uint32_t BLACK = NeoPixel::Color(0x00, 0x00, 0x00);
-const uint32_t RED = NeoPixel::Color(0xFF, 0x00, 0x00);
-const uint32_t ORANGE = NeoPixel::Color(0xCC, 0x44, 0x00);
-const uint32_t YELLOW = NeoPixel::Color(0xFF, 0xFF, 0x00);
-const uint32_t YELLOWGREEN = NeoPixel::Color(0xCC, 0xFF, 0x00);
-const uint32_t GREEN = NeoPixel::Color(0x00, 0xFF, 0x00);
-const uint32_t BLUE = NeoPixel::Color(0x00, 0x00, 0x77);
-const uint32_t PURPLE = NeoPixel::Color(0x77, 0x00, 0x77);
-static const uint8_t BRIGHTNESS = 4;
+
+// Same packing as NeoPixel::Color(), which isn't constexpr: calling it here would copy every
+// color into SRAM at startup instead of leaving it in flash.
+constexpr uint32_t rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+constexpr uint32_t BLACK = rgb(0x00, 0x00, 0x00);
+constexpr uint32_t RED = rgb(0xFF, 0x00, 0x00);
+constexpr uint32_t ORANGE = rgb(0xCC, 0x44, 0x00);
+constexpr uint32_t YELLOW = rgb(0xFF, 0xFF, 0x00);
+constexpr uint32_t YELLOWGREEN = rgb(0xCC, 0xFF, 0x00);
+constexpr uint32_t GREEN = rgb(0x00, 0xFF, 0x00);
+constexpr uint32_t BLUE = rgb(0x00, 0x00, 0x77);
+constexpr uint32_t PURPLE = rgb(0x77, 0x00, 0x77);
+static const uint8_t BRIGHTNESS = 5;
 #if defined(USE_TINYNEOPIXEL)
 static const uint8_t LED_IN_PIN = 16;
 #else
@@ -35,11 +42,11 @@ static const int WIDTH = MAZE_RUNNER_WIDTH;
 static const int HEIGHT = MAZE_RUNNER_HEIGHT;
 
 // Maze options.
-const MazeOptions mazeOptions = {
+constexpr MazeOptions mazeOptions = {
   true,  // outerWalls
   true,  // preventDiagonalTouching
   false, // perfectVision
-  NeoPixel::Color(0x04, 0x04, 0x04), // visitedColor
+  rgb(0x04, 0x04, 0x04), // visitedColor
   true   // sentryPatrol
 };
 
@@ -85,7 +92,7 @@ void handleOnReceive(int bytesReceived)
 
 void setup()
 {
-  randomSeed(analogRead(A0)); 
+  randomSeed(analogRead(A0) ^ analogRead(A1) ^ analogRead(A2));
 
   Wire.begin(I2C_ADDRESS);
   Wire.onReceive(handleOnReceive);

@@ -21,7 +21,7 @@
 #define MAZE_RUNNER_WIDTH 16
 #endif
 #ifndef MAZE_RUNNER_HEIGHT
-#define MAZE_RUNNER_HEIGHT 15
+#define MAZE_RUNNER_HEIGHT 16
 #endif
 
 #if MAZE_RUNNER_WIDTH < 1 || MAZE_RUNNER_HEIGHT < 1 || MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT > 256
@@ -29,8 +29,10 @@
 #endif
 
 // Fixed-size implementation for small AVR targets. Cell indexes are one byte.
-static const uint16_t MAZE_MAX_CELLS = MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT; // TODO: save memory by reducing this
+static const uint16_t MAZE_MAX_CELLS = MAZE_RUNNER_WIDTH * MAZE_RUNNER_HEIGHT;
 static const uint16_t MAZE_BITSET_BYTES = (MAZE_MAX_CELLS + 7) / 8;
+// Search parent links: 2 bits per cell (an index into Directions).
+static const uint16_t MAZE_PARENT_BYTES = (MAZE_MAX_CELLS + 3) / 4;
 
 struct MazeOptions
 {
@@ -47,7 +49,7 @@ struct MazeOptions
   // spawns at a random spot and stands still until it senses the runner.
   bool sentryPatrol;
 
-  MazeOptions(bool outer = false, bool diagonal = false,
+  constexpr MazeOptions(bool outer = false, bool diagonal = false,
               bool vision = true, uint32_t visited = 0x000020UL,
               bool patrol = false)
     : outerWalls(outer), preventDiagonalTouching(diagonal),
@@ -81,12 +83,13 @@ const Direction Up = {0, -1};
 const Direction Down = {0, 1};
 const Direction Directions[] = {Left, Right, Up, Down};
 
-inline void shuffle(Direction *list, int size)
+template <typename T>
+inline void shuffle(T *list, int size)
 {
   for (int i = 0; i < size; ++i)
   {
     int index = random(size);
-    Direction temp = list[i];
+    T temp = list[i];
     list[i] = list[index];
     list[index] = temp;
   }
@@ -106,11 +109,16 @@ private:
   static const int GoalDelay = 10;
   static const int CatchDelay = 30;
   static const int ErrorDelay = 30000;
+  // Frames after which an unfinished round is abandoned for a new maze. Runner and sentry can
+  // reach standoffs that never resolve (a stationary sentry beside the only route, or a chase
+  // around a loop where the faster runner is never caught but never gets past).
+  static const uint16_t RoundTimeout = 3000;
 
   int _width;
   int _height;
   uint8_t _mazeWalls[MAZE_BITSET_BYTES];
   int _resetDelay = -1;
+  uint16_t _roundFrames = 0;
   Location _exitLoc = NullLocation;
   int _mazeExtraWallsToRemove = 1;
 
@@ -123,6 +131,8 @@ private:
   Location _runnerSpawnLoc = NullLocation;
   bool _runnerCaught = false;
   uint8_t _runnerCooldown = 0;
+  // The runner's planned route, and also the one cell-sized scratch buffer: findPath() uses it
+  // as its queue and generateMaze() as its carving stack. Any search therefore replaces the plan.
   uint8_t _runnerPath[MAZE_MAX_CELLS];
   uint16_t _runnerPathSize = 0;
   uint8_t _runnerVisited[MAZE_BITSET_BYTES] = {};
@@ -219,16 +229,23 @@ private:
   bool leadsToJunction(Location from, Location prev) const;
   int openNeighborCount(Location loc) const;
   bool isJunction(Location loc) const { return !isWall(loc) && openNeighborCount(loc) >= 3; }
-  bool findNearestJunctionPath(Location start, uint8_t *outPath, uint16_t &outSize);
+  // What findPath() searches for.
+  enum SearchGoal : uint8_t
+  {
+    GoalCell,              // `target`
+    GoalJunction,          // nearest junction other than the start
+    GoalUnvisited,         // nearest cell the runner has not explored
+    GoalFarthest,          // last cell reached (farthest within the depth limit)
+    GoalFarthestInnerEdge, // farthest open cell against the outer wall
+  };
+  static const uint8_t NoDepthLimit = 0;
+  bool findPath(SearchGoal goal, Location start, Location target, Location avoid,
+                uint8_t maxDepth, uint16_t &outSize);
   void drawMaze();
   void generateMaze();
   //void placeRunner();
   void placeSentry();
   //void placeExit();
-  bool findPathDfs(Location startLoc, Location sentryLoc, Location endLoc,
-                   int maxSearchDistance, uint8_t *outPath, uint16_t &outSize);
-  bool findLongestPathBfs(Location startLoc, Location sentryLoc,
-                          int maxSearchDistance, uint8_t *outPath, uint16_t &outSize, bool edgeOnly = false);
   bool isAdjacent(Location a, Location b) { return isInBounds(a) && isInBounds(b) && abs(a.x-b.x)+abs(a.y-b.y)==1; }
   bool isWall(int x, int y) const;
   bool isWall(Location loc) const;
@@ -239,7 +256,6 @@ private:
   bool hasDiagonalOnlyNeighbor(Location loc) const;
   bool isVisited(uint8_t cell) const { return (_runnerVisited[cell >> 3] & (uint8_t)(1U << (cell & 7))) != 0; }
   void markVisited(Location loc) { if (isInBounds(loc)) { uint8_t cell = encode(loc); _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7)); } }
-  bool findNearestUnvisitedPath(Location start, uint8_t *outPath, uint16_t &outSize);
   bool isInnerEdgeCell(Location loc) const;
   bool isCorridorWall(Location loc) const;
 };
@@ -254,6 +270,7 @@ inline void MazeRunner::init()
   for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] = 0;
   // TODO hate how these are set manually here
   _runnerCaught = false;
+  _roundFrames = 0;
   generateMaze();
   _runnerSpawnLoc = _runnerLoc;
   placeSentry();
@@ -285,6 +302,7 @@ inline void MazeRunner::retryRound()
 {
   log_d("Retrying maze");
   _runnerCaught = false;
+  _roundFrames = 0;
   _runnerLoc = _runnerSpawnLoc;
   clearRunnerPath();
   _runnerSentryKnownLoc = NullLocation;
@@ -304,14 +322,17 @@ inline bool MazeRunner::update()
     if (_resetDelay < 0)
     {
       if (_runnerCaught) retryRound(); // same maze, runner and sentry back at their starts
-      else
-      {
-        init(); // new maze
-        drawMaze();
-      }
+      else init(); // new maze (init draws it)
       return true;
     }
     return false;
+  }
+
+  if (++_roundFrames > RoundTimeout)
+  {
+    log_w("Round stalled; starting a new maze");
+    init();
+    return true;
   }
 
   bool changed = moveRunner();
@@ -348,30 +369,36 @@ inline bool MazeRunner::moveRunner()
 
   if (!_options.perfectVision) markVisited(_runnerLoc);
 
-  uint16_t tempSize = 0;
-  bool sensed = _sentryActive &&
-    findPathDfs(_runnerLoc, NullLocation, _sentryLoc, RunnerSense, _runnerPath, tempSize) &&
-    tempSize > 0;
+  bool sensed = false;
+  if (_sentryActive)
+  {
+    uint16_t senseSize = 0;
+    sensed = findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation, RunnerSense, senseSize) &&
+             senseSize > 0;
+    // That search used _runnerPath as its queue, so the previous plan is gone either way.
+    _runnerPathSize = 0;
+  }
 
   // sense and flee if sentry is near
   if (sensed)
   {
     _runnerSentryKnownLoc = _sentryLoc;
-    findLongestPathBfs(_runnerLoc, _sentryLoc, RunnerSense + RunnerFear, _runnerPath, _runnerPathSize);
+    findPath(GoalFarthest, _runnerLoc, NullLocation, _sentryLoc, RunnerSense + RunnerFear,
+             _runnerPathSize);
     if (_runnerPathSize > RunnerSense) _runnerPathSize = RunnerSense;
   }
   // plan if able
   else if (_runnerPathSize == 0)
   {
     // If the exit is nearby, head for it instead of walking past to explore.
-    if (!findPathDfs(_runnerLoc, _runnerSentryKnownLoc, _exitLoc, 2,
-                     _runnerPath, _runnerPathSize))
+    if (!findPath(GoalCell, _runnerLoc, _exitLoc, _runnerSentryKnownLoc, 2, _runnerPathSize))
     {
       if (!_options.perfectVision)
-        findNearestUnvisitedPath(_runnerLoc, _runnerPath, _runnerPathSize);
+        findPath(GoalUnvisited, _runnerLoc, NullLocation, _sentryLoc, NoDepthLimit,
+                 _runnerPathSize);
       if (_runnerPathSize == 0)
-        findPathDfs(_runnerLoc, _runnerSentryKnownLoc, _exitLoc, -1,
-                    _runnerPath, _runnerPathSize);
+        findPath(GoalCell, _runnerLoc, _exitLoc, _runnerSentryKnownLoc, NoDepthLimit,
+                 _runnerPathSize);
     }
     _runnerSentryKnownLoc = NullLocation;
   }
@@ -406,16 +433,16 @@ inline bool MazeRunner::moveSentry()
   uint16_t pathSize = 0;
   Location next = NullLocation;
 
-  bool seesRunner = findPathDfs(_sentryLoc, NullLocation, _runnerLoc,
-                                SentrySense, _runnerPath, pathSize) && pathSize > 0;
+  bool seesRunner = findPath(GoalCell, _sentryLoc, _runnerLoc, NullLocation,
+                             SentrySense, pathSize) && pathSize > 0;
   if (seesRunner)
   {
     _sentryKnownRunnerLoc = _runnerLoc;
     next = decode(_runnerPath[0]);
   }
   else if (isInBounds(_sentryKnownRunnerLoc) && _sentryKnownRunnerLoc != _sentryLoc &&
-           findPathDfs(_sentryLoc, NullLocation, _sentryKnownRunnerLoc,
-                       -1, _runnerPath, pathSize) && pathSize > 0)
+           findPath(GoalCell, _sentryLoc, _sentryKnownRunnerLoc, NullLocation,
+                    NoDepthLimit, pathSize) && pathSize > 0)
   {
     // Recalculated one step at a time so the sentry doesn't need a second full-size path buffer.
     next = decode(_runnerPath[0]);
@@ -440,7 +467,7 @@ inline bool MazeRunner::moveSentry()
     if (next != _runnerLoc)
     {
       uint16_t escapeSize = 0;
-      escapeExists = findPathDfs(_runnerLoc, next, _exitLoc, -1, _runnerPath, escapeSize);
+      escapeExists = findPath(GoalCell, _runnerLoc, _exitLoc, next, NoDepthLimit, escapeSize);
     }
     if (!escapeExists)
     {
@@ -487,7 +514,7 @@ inline Location MazeRunner::sentryPatrol()
   }
 
   uint16_t pathSize = 0;
-  if (findNearestJunctionPath(_sentryLoc, _runnerPath, pathSize))
+  if (findPath(GoalJunction, _sentryLoc, NullLocation, NullLocation, NoDepthLimit, pathSize))
     return decode(_runnerPath[0]);
 
   Direction steps[4] = {Left, Right, Up, Down};
@@ -554,64 +581,6 @@ inline bool MazeRunner::leadsToJunction(Location cur, Location prev) const
 inline int MazeRunner::openNeighborCount(Location loc) const
 {
   return 4 - getAdjacentWallAndBorderCount(loc);
-}
-
-// BFS to the nearest junction other than `start`.
-inline bool MazeRunner::findNearestJunctionPath(Location start, uint8_t *outPath, uint16_t &outSize)
-{
-  outSize = 0;
-  if (!isInBounds(start)) return false;
-
-  uint8_t queue[MAZE_MAX_CELLS];
-  uint8_t parent[MAZE_MAX_CELLS];
-  uint8_t visited[MAZE_BITSET_BYTES] = {};
-  uint16_t head = 0, tail = 0;
-  uint8_t startId = encode(start);
-  queue[tail++] = startId;
-  parent[startId] = startId;
-  visited[startId >> 3] |= (uint8_t)(1U << (startId & 7));
-  uint8_t target = startId;
-  bool found = false;
-
-  while (head < tail)
-  {
-    uint8_t id = queue[head++];
-    Location cur = decode(id);
-    if (id != startId && isJunction(cur))
-    {
-      target = id;
-      found = true;
-      break;
-    }
-
-    Direction steps[4] = {Left, Right, Up, Down};
-    shuffle(steps, 4);
-    for (int i = 0; i < 4; ++i)
-    {
-      Location next = cur + steps[i];
-      if (!isInBounds(next) || isWall(next)) continue;
-      uint8_t nid = encode(next);
-      if (visited[nid >> 3] & (uint8_t)(1U << (nid & 7))) continue;
-      visited[nid >> 3] |= (uint8_t)(1U << (nid & 7));
-      parent[nid] = id;
-      if (tail < MAZE_MAX_CELLS) queue[tail++] = nid;
-    }
-  }
-
-  if (!found) return false;
-  uint8_t cur = target;
-  while (cur != startId && outSize < MAZE_MAX_CELLS)
-  {
-    outPath[outSize++] = cur;
-    cur = parent[cur];
-  }
-  for (uint16_t i = 0; i < outSize / 2; ++i)
-  {
-    uint8_t temp = outPath[i];
-    outPath[i] = outPath[outSize - 1 - i];
-    outPath[outSize - 1 - i] = temp;
-  }
-  return outSize > 0;
 }
 
 inline void MazeRunner::drawMaze()
@@ -712,8 +681,8 @@ inline void MazeRunner::generateMaze()
     setWall(start.x, start.y, false);
   }
 
-  // Generate a spanning tree from the runner's start.
-  uint8_t stackCells[MAZE_MAX_CELLS];
+  // Generate a spanning tree from the runner's start, using _runnerPath as the carving stack.
+  uint8_t *stackCells = _runnerPath;
   uint16_t stackSize = 0;
   stackCells[stackSize++] = encode(start);
   int maxCycles = 1000;
@@ -747,8 +716,8 @@ inline void MazeRunner::generateMaze()
   // farthest-exit behavior. In outer-wall mode, this is an inner-edge cell.
   _exitLoc = NullLocation;
   uint16_t pathSize = 0;
-  if (!findLongestPathBfs(_runnerLoc, NullLocation, -1,
-                          _runnerPath, pathSize, _options.outerWalls) ||
+  if (!findPath(_options.outerWalls ? GoalFarthestInnerEdge : GoalFarthest, _runnerLoc,
+                NullLocation, NullLocation, NoDepthLimit, pathSize) ||
       pathSize == 0)
   {
     log_e("Failed to find path to exit");
@@ -806,66 +775,6 @@ inline void MazeRunner::generateMaze()
           _runnerLoc.x, _runnerLoc.y, _exitLoc.x, _exitLoc.y);
 }
 
-// inline void MazeRunner::placeRunner()
-// {
-//   clearRunnerPath();
-//   _runnerSentryKnownLoc = NullLocation;
-//   _runnerCooldown = 0;
-
-//   if (_options.outerWalls)
-//   {
-//     if (isInBounds(_runnerLoc))
-//     {
-//       Location inside = _runnerLoc;
-//       if (inside.x == 0) ++inside.x;
-//       else if (inside.x == _width - 1) --inside.x;
-//       else if (inside.y == 0) ++inside.y;
-//       else if (inside.y == _height - 1) --inside.y;
-//       setWall(_runnerLoc.x, _runnerLoc.y, false);
-//       setWall(inside.x, inside.y, false);
-//       return;
-//     }
-//     // Start at a perimeter entrance connected to an open inner-edge cell.
-//     for (int attempts = 0; attempts < (_width + _height) * 4; ++attempts)
-//     {
-//       int side = random(4);
-//       int x = 1, y = 1;
-//       if (side < 2) { x = 1 + random(_width - 2); y = side == 0 ? 1 : _height - 2; }
-//       else { y = 1 + random(_height - 2); x = side == 2 ? 1 : _width - 2; }
-//       if (!isWall(x, y))
-//       {
-//         _runnerLoc = {x, y};
-//         if (y == 1) _runnerLoc = {x, 0};
-//         else if (y == _height - 2) _runnerLoc = {x, _height - 1};
-//         else if (x == 1) _runnerLoc = {0, y};
-//         else if (x == _width - 2) _runnerLoc = {_width - 1, y};
-//         setWall(_runnerLoc.x, _runnerLoc.y, false);
-//         return;
-//       }
-//     }
-//     // Small or unusually shaped mazes may not have a carved inner-edge cell.
-//     _runnerLoc = {1, 1};
-//     setWall(1, 1, false);
-//     _runnerLoc = {1, 0};
-//     setWall(1, 0, false);
-//     return;
-//   }
-
-//   if (_runnerLoc.x > 0 && _runnerLoc.y > 0)
-//   {
-//     if (_runnerLoc == _exitLoc || (_sentryActive && _runnerLoc == _sentryLoc)) return;
-//     log_e("Runner unexpectedly not at exit or sentry loc: (%d,%d)", _runnerLoc.x, _runnerLoc.y);
-//   }
-
-//   int attempts = 0;
-//   while (_runnerLoc.x < 0 || _runnerLoc.y < 0)
-//   {
-//     int x = random(_width), y = random(_height);
-//     if (!isWall(x,y)) _runnerLoc = {x,y};
-//     if (++attempts > 1000) break;
-//   }
-//   log_d("Placing runner at (%d,%d) after %d attempts", _runnerLoc.x, _runnerLoc.y, attempts);
-// }
 
 inline void MazeRunner::placeSentry()
 {
@@ -910,7 +819,7 @@ inline void MazeRunner::placeSentry()
     {
       // Reject positions that would cut off every runner route to the exit.
       uint16_t escapeSize = 0;
-      bool escapeExists = findPathDfs(_runnerLoc, candidate, _exitLoc, -1, _runnerPath, escapeSize);
+      bool escapeExists = findPath(GoalCell, _runnerLoc, _exitLoc, candidate, NoDepthLimit, escapeSize);
       _runnerPathSize = 0;
       if (escapeExists) _sentryLoc = candidate;
     }
@@ -927,7 +836,7 @@ inline void MazeRunner::placeSentry()
         uint16_t escapeSize = 0;
         if (!isWall(candidate) && candidate != _runnerLoc && candidate != _exitLoc)
         {
-          bool escapeExists = findPathDfs(_runnerLoc, candidate, _exitLoc, -1, _runnerPath, escapeSize);
+          bool escapeExists = findPath(GoalCell, _runnerLoc, _exitLoc, candidate, NoDepthLimit, escapeSize);
           _runnerPathSize = 0;
           if (escapeExists) _sentryLoc = candidate;
         }
@@ -937,226 +846,83 @@ inline void MazeRunner::placeSentry()
   log_d("Placing sentry at (%d,%d) after %d attempts", _sentryLoc.x, _sentryLoc.y, attempts);
 }
 
-// /// Places the exit location in the maze, picking the farthest reachable cell from the runner's start.
-// inline void MazeRunner::placeExit()
-// {
-//   _exitLoc = NullLocation;
-//   uint16_t pathSize = 0;
-//   if (!findLongestPathBfs(_runnerLoc, NullLocation, -1, _runnerPath, pathSize, _options.outerWalls) || pathSize == 0)
-//   {
-//     log_e("Failed to find path to exit");
-//     if (_setStatus) _setStatus(_exitColor);
-//     _resetDelay = ErrorDelay;
-//     return;
-//   }
-//   _exitLoc = decode(_runnerPath[pathSize - 1]);
-//   if (_options.outerWalls)
-//   {
-//     Location inside = _exitLoc;
-//     if (inside.y == 1) --_exitLoc.y;
-//     else if (inside.y == _height - 2) ++_exitLoc.y;
-//     else if (inside.x == 1) --_exitLoc.x;
-//     else if (inside.x == _width - 2) ++_exitLoc.x;
-//     else
-//     {
-//       // No reachable inner-edge cell was found.
-//       log_e("Failed to place perimeter exit");
-//       return;
-//     }
-//     setWall(_exitLoc.x, _exitLoc.y, false);
-//   }
-//   clearRunnerPath();
-//   log_d("Placing exit at (%d,%d) with distance %d from runner", _exitLoc.x, _exitLoc.y, pathSize);
-// }
-
-inline bool MazeRunner::findPathDfs(Location start, Location sentry, Location end,
-                                    int maxDistance, uint8_t *outPath, uint16_t &outSize)
+// Breadth-first search over open cells from `start`, never entering `avoid`. On success, writes
+// the route (excluding `start`) to _runnerPath and its length to outSize; GoalCell succeeds with
+// an empty route when start == target. With a depth limit, only cells within maxDepth steps are
+// considered. _runnerPath doubles as the queue and parent links take 2 bits per cell, so the
+// stack cost is MAZE_BITSET_BYTES + MAZE_PARENT_BYTES.
+inline bool MazeRunner::findPath(SearchGoal goal, Location start, Location target, Location avoid,
+                                 uint8_t maxDepth, uint16_t &outSize)
 {
   outSize = 0;
-  if (!isInBounds(start) || !isInBounds(end)) return false;
+  if (!isInBounds(start) || (goal == GoalCell && !isInBounds(target))) return false;
 
-  // Mark cells when pushed, so the bounded stack cannot grow beyond cell count.
-  uint8_t *stackCell = outPath; // reuse out buffer to save memory
-  uint8_t parent[MAZE_MAX_CELLS];
-  uint8_t visited[MAZE_BITSET_BYTES] = {};
-  uint16_t top = 0;
-  uint8_t startId = encode(start);
-  stackCell[top] = startId;
-  ++top;
-  visited[startId >> 3] |= (uint8_t)(1U << (startId & 7));
-  parent[startId] = startId;
-
-  bool found = false;
-  while (top)
-  {
-    --top;
-    uint8_t id = stackCell[top];
-    Location cur = decode(id);
-    if (cur == end) { found = true; break; }
-    if (maxDistance > 0)
-    {
-      uint16_t depth = 0;
-      uint8_t ancestor = id;
-      while (ancestor != startId && depth <= (uint16_t)maxDistance)
-      {
-        ancestor = parent[ancestor];
-        ++depth;
-      }
-      if (depth >= (uint16_t)maxDistance) continue;
-    }
-
-    Direction steps[4] = {Left, Right, Up, Down};
-    shuffle(steps, 4);
-    for (int i=0; i<4; ++i)
-    {
-      Location next = cur + steps[i];
-      if (!isInBounds(next) || isWall(next) || next == sentry) continue;
-      uint8_t nid = encode(next);
-      if (visited[nid >> 3] & (uint8_t)(1U << (nid & 7))) continue;
-      visited[nid >> 3] |= (uint8_t)(1U << (nid & 7));
-      parent[nid] = id;
-      if (top < MAZE_MAX_CELLS)
-      {
-        stackCell[top] = nid;
-        ++top;
-      }
-    }
-  }
-
-  if (!found) return false;
-  uint8_t cur = encode(end);
-  while (cur != startId && outSize < MAZE_MAX_CELLS)
-  {
-    outPath[outSize++] = cur;
-    cur = parent[cur];
-  }
-  for (uint16_t i = 0; i < outSize / 2; ++i)
-  {
-    uint8_t temp = outPath[i];
-    outPath[i] = outPath[outSize - 1 - i];
-    outPath[outSize - 1 - i] = temp;
-  }
-  return true;
-}
-
-inline bool MazeRunner::findLongestPathBfs(Location start, Location sentry,
-                                           int maxDistance, uint8_t *outPath, uint16_t &outSize, bool edgeOnly)
-{
-  outSize = 0;
-  if (!isInBounds(start)) return false;
-
-  uint8_t *queue = outPath; // reuse out buffer to save memory
-  uint8_t parent[MAZE_MAX_CELLS];
-  uint8_t visited[MAZE_BITSET_BYTES] = {};
-  uint16_t head = 0, tail = 0;
-  uint8_t startId = encode(start);
+  uint8_t reached[MAZE_BITSET_BYTES] = {};
+  uint8_t parentDir[MAZE_PARENT_BYTES] = {}; // per cell: Directions index pointing to its parent
+  uint8_t *queue = _runnerPath;
+  const uint8_t startId = encode(start);
+  const uint8_t targetId = goal == GoalCell ? encode(target) : startId;
+  uint16_t head = 0, tail = 0, levelEnd = 1;
+  uint8_t depth = 0;
   queue[tail++] = startId;
-  parent[startId] = startId;
-  visited[startId >> 3] |= (uint8_t)(1U << (startId & 7));
-  uint8_t farthest = startId;
+  reached[startId >> 3] |= (uint8_t)(1U << (startId & 7));
+  uint8_t found = startId;
+  bool success = false;
 
   while (head < tail)
   {
+    if (head == levelEnd) { ++depth; levelEnd = tail; }
     uint8_t id = queue[head++];
     Location cur = decode(id);
-    if (!edgeOnly || isInnerEdgeCell(cur)) farthest = id; // BFS visits cells in nondecreasing distance order.
-    if (maxDistance > 0)
+    switch (goal)
     {
-      uint16_t depth = 0;
-      uint8_t ancestor = id;
-      while (ancestor != startId && depth <= (uint16_t)maxDistance)
-      {
-        ancestor = parent[ancestor];
-        ++depth;
-      }
-      if (depth >= (uint16_t)maxDistance) continue;
+      case GoalCell: success = id == targetId; break;
+      case GoalJunction: success = id != startId && isJunction(cur); break;
+      case GoalUnvisited: success = id != startId && !isVisited(id); break;
+      // BFS dequeues cells in nondecreasing distance order, so the last match is the farthest.
+      case GoalFarthest: found = id; break;
+      case GoalFarthestInnerEdge: if (isInnerEdgeCell(cur)) found = id; break;
     }
+    if (success) { found = id; break; }
+    if (maxDepth != NoDepthLimit && depth >= maxDepth) continue;
 
-    Direction steps[4] = {Left, Right, Up, Down};
-    shuffle(steps, 4);
-    for (int i=0; i<4; ++i)
+    uint8_t order[4] = {0, 1, 2, 3};
+    shuffle(order, 4);
+    for (uint8_t i = 0; i < 4; ++i)
     {
-      Location next = cur + steps[i];
-      if (!isInBounds(next) || isWall(next) || next == sentry) continue;
+      uint8_t dir = order[i];
+      Location next = cur + Directions[dir];
+      if (!isInBounds(next) || isWall(next) || next == avoid) continue;
       uint8_t nid = encode(next);
-      if (visited[nid >> 3] & (uint8_t)(1U << (nid & 7))) continue;
-      visited[nid >> 3] |= (uint8_t)(1U << (nid & 7));
-      parent[nid] = id;
-      queue[tail++] = nid;
+      uint8_t mask = (uint8_t)(1U << (nid & 7));
+      if (reached[nid >> 3] & mask) continue;
+      reached[nid >> 3] |= mask;
+      // Directions keeps opposites adjacent (Left/Right, Up/Down), so dir ^ 1 points back.
+      parentDir[nid >> 2] |= (uint8_t)((dir ^ 1) << ((nid & 3) * 2));
+      queue[tail++] = nid; // each cell is queued at most once, so tail <= MAZE_MAX_CELLS
     }
   }
 
-  if (farthest == startId) return false;
-  uint8_t cur = farthest;
-  while (cur != startId && outSize < MAZE_MAX_CELLS)
+  if (goal == GoalFarthest || goal == GoalFarthestInnerEdge) success = found != startId;
+  if (!success) return false;
+
+  // Walk the parent links back to the start, then reverse into start-to-goal order.
+  for (uint8_t id = found; id != startId; ++outSize)
   {
-    outPath[outSize++] = cur;
-    cur = parent[cur];
+    _runnerPath[outSize] = id;
+    uint8_t dir = (parentDir[id >> 2] >> ((id & 3) * 2)) & 3;
+    if (dir == 0) --id;
+    else if (dir == 1) ++id;
+    else if (dir == 2) id -= _width;
+    else id += _width;
   }
   for (uint16_t i = 0; i < outSize / 2; ++i)
   {
-    uint8_t temp = outPath[i];
-    outPath[i] = outPath[outSize - 1 - i];
-    outPath[outSize - 1 - i] = temp;
+    uint8_t temp = _runnerPath[i];
+    _runnerPath[i] = _runnerPath[outSize - 1 - i];
+    _runnerPath[outSize - 1 - i] = temp;
   }
-  return outSize > 0;
-}
-
-inline bool MazeRunner::findNearestUnvisitedPath(Location start, uint8_t *outPath, uint16_t &outSize)
-{
-  outSize = 0;
-  if (!isInBounds(start)) return false;
-
-  uint8_t *queue = outPath; // reuse out buffer to save memory
-  uint8_t parent[MAZE_MAX_CELLS];
-  uint8_t visited[MAZE_BITSET_BYTES] = {};
-  uint16_t head = 0, tail = 0;
-  uint8_t startId = encode(start);
-  queue[tail++] = startId;
-  parent[startId] = startId;
-  visited[startId >> 3] |= (uint8_t)(1U << (startId & 7));
-  uint8_t target = startId;
-  bool found = false;
-
-  while (head < tail && !found)
-  {
-    uint8_t id = queue[head++];
-    if (id != startId && !isVisited(id))
-    {
-      target = id;
-      found = true;
-      break;
-    }
-
-    Location cur = decode(id);
-    Direction steps[4] = {Left, Right, Up, Down};
-    shuffle(steps, 4);
-    for (int i = 0; i < 4; ++i)
-    {
-      Location next = cur + steps[i];
-      if (!isInBounds(next) || isWall(next) || next == _sentryLoc) continue;
-      uint8_t nid = encode(next);
-      if (visited[nid >> 3] & (uint8_t)(1U << (nid & 7))) continue;
-      visited[nid >> 3] |= (uint8_t)(1U << (nid & 7));
-      parent[nid] = id;
-      if (tail < MAZE_MAX_CELLS) queue[tail++] = nid;
-    }
-  }
-
-  if (!found) return false;
-  uint8_t cur = target;
-  while (cur != startId && outSize < MAZE_MAX_CELLS)
-  {
-    outPath[outSize++] = cur;
-    cur = parent[cur];
-  }
-  for (uint16_t i = 0; i < outSize / 2; ++i)
-  {
-    uint8_t temp = outPath[i];
-    outPath[i] = outPath[outSize - 1 - i];
-    outPath[outSize - 1 - i] = temp;
-  }
-  return outSize > 0;
+  return true;
 }
 
 inline bool MazeRunner::isWall(int x, int y) const { return wallAt(x, y); }
