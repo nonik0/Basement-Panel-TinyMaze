@@ -144,16 +144,30 @@ class MazeRunner
 {
 private:
   static const int ErrorDelay = 30000;
+  static const uint8_t NoDepthLimit = 0;
+  static const uint8_t MaxZoneCells = 2 * MAZE_MAX_SENSE * (MAZE_MAX_SENSE + 1) + 1;
 
+  // configuration
   int _width;
   int _height;
-  uint8_t _mazeWalls[MAZE_BITSET_BYTES];
-  int _resetDelay = -1;
-  uint16_t _roundFrames = 0;
-  Location _exitLoc = NullLocation;
-
   uint32_t _pathColor, _wallColor, _runnerColor, _sentryColor, _exitColor;
   MazeOptions _options;
+
+  // callbacks
+  typedef void (*DrawPixelCallback)(int, int, uint32_t);
+  typedef void (*StatusCallback)(uint32_t);
+  DrawPixelCallback _drawPixel;
+  StatusCallback _setStatus;
+
+  // maze and round state
+  uint8_t _mazeWalls[MAZE_BITSET_BYTES];
+  Location _exitLoc = NullLocation;
+  int _resetDelay = -1;
+  uint16_t _roundFrames = 0;
+  
+  // shared path buffer used by findPath()
+  uint8_t _searchPath[MAZE_MAX_CELLS];
+  uint16_t _searchPathSize = 0;
 
   // runner state
   Location _runnerLoc = NullLocation;
@@ -163,11 +177,6 @@ private:
   uint8_t _runnerFleeWait = 0;
   bool _runnerCaught = false;
   uint8_t _runnerCooldown = 0;
-  // Shared search buffer, and the runner's planned route while it follows one: findPath() uses
-  // it as its queue and generateMaze() as its carving stack, so any search replaces the plan.
-  uint8_t _searchPath[MAZE_MAX_CELLS];
-  uint16_t _searchPathSize = 0;
-  // Cells the runner has seen (exploring mode) from everywhere it has been; see markSeen().
   uint8_t _runnerVisited[MAZE_BITSET_BYTES] = {};
   
   // sentry state
@@ -177,46 +186,6 @@ private:
   Location _sentryPrevLoc = NullLocation;
   Location _sentrySpawnLoc = NullLocation;
   uint8_t _sentryCooldown = 0;
-
-  typedef void (*DrawPixelCallback)(int, int, uint32_t);
-  typedef void (*StatusCallback)(uint32_t);
-  DrawPixelCallback _drawPixel;
-  StatusCallback _setStatus;
-
-  uint8_t encode(Location loc) const { return (uint8_t)(loc.y * _width + loc.x); }
-  Location decode(uint8_t cell) const { return {(int)(cell % _width), (int)(cell / _width)}; }
-  bool wallAt(int x, int y) const
-  {
-    uint16_t cell = (uint16_t)y * _width + x;
-    return (_mazeWalls[cell >> 3] & (uint8_t)(1U << (cell & 7))) != 0;
-  }
-  void setWall(int x, int y, bool wall)
-  {
-    uint16_t cell = (uint16_t)y * _width + x;
-    uint8_t mask = (uint8_t)(1U << (cell & 7));
-    if (wall) _mazeWalls[cell >> 3] |= mask;
-    else _mazeWalls[cell >> 3] &= (uint8_t)~mask;
-  }
-
-  bool pathEmpty(const uint8_t *path, uint16_t size) const { (void)path; return size == 0; }
-  void clearSearchPath() { _searchPathSize = 0; }
-
-  bool appendPath(uint8_t *path, uint16_t &size, uint8_t cell)
-  {
-    if (size >= MAZE_MAX_CELLS) return false;
-    path[size++] = cell;
-    return true;
-  }
-
-  bool popFrontPath(uint8_t *path, uint16_t &size, Location &loc)
-  {
-    if (!size) return false;
-    loc = decode(path[0]);
-    for (uint16_t i = 1; i < size; ++i) path[i - 1] = path[i];
-    --size;
-    return true;
-  }
-
 public:
   MazeRunner(int width, int height,
              uint32_t pathColor, uint32_t wallColor,
@@ -257,16 +226,23 @@ public:
   bool update();
 
 private:
+  // maze functions
+  void drawMaze();
+  void generateMaze();
+
+  // runner and round functions
+  bool moveRunner();
   void resolveStartFromLastRound();
   void retryRound();
-  bool moveRunner();
+
+  // sentry behavior
+  void placeSentry();
   bool moveSentry();
   Location sentryPatrol();
   Location chooseJunctionPath();
-  bool leadsToJunction(Location from, Location prev) const;
-  int openNeighborCount(Location loc) const;
-  bool isJunction(Location loc) const { return !isWall(loc) && openNeighborCount(loc) >= 3; }
-  // What findPath() searches for.
+
+  // pathing
+  // TODO: find path can return outSize instead of bool? 0 or -1 can be no path? Also outSize is never more than 255 so can be uint8_t?
   enum SearchGoal : uint8_t
   {
     GoalCell,              // `target`
@@ -275,30 +251,32 @@ private:
     GoalFarthest,          // last cell reached (farthest within the depth limit)
     GoalFarthestInnerEdge, // farthest open cell against the outer wall
   };
-  static const uint8_t NoDepthLimit = 0;
   bool findPath(SearchGoal goal, Location start, Location target, Location avoid,
                 uint8_t maxDepth, uint16_t &outSize, uint8_t avoidRadius = 0);
-  void drawMaze();
-  void generateMaze();
-  //void placeRunner();
-  void placeSentry();
-  //void placeExit();
-  bool isAdjacent(Location a, Location b) { return isInBounds(a) && isInBounds(b) && abs(a.x-b.x)+abs(a.y-b.y)==1; }
-  bool isWall(int x, int y) const;
-  bool isWall(Location loc) const;
-  bool isInBounds(int x, int y) const;
-  bool isInBounds(Location loc) const;
-  int getAdjacentWallAndBorderCount(int x, int y) const;
-  int getAdjacentWallAndBorderCount(Location loc) const;
-  bool hasDiagonalOnlyNeighbor(Location loc) const;
-  bool isVisited(uint8_t cell) const { return (_runnerVisited[cell >> 3] & (uint8_t)(1U << (cell & 7))) != 0; }
-  // Zones (avoid areas, around-corner sight) never exceed runnerSense, so their queue is sized
-  // for MAZE_MAX_SENSE.
-  static const uint8_t MaxZoneCells = 2 * MAZE_MAX_SENSE * (MAZE_MAX_SENSE + 1) + 1;
-  void markWithin(Location center, uint8_t radius, uint8_t *cells) const;
+  bool appendPath(uint8_t *path, uint16_t &size, uint8_t cell);
+  bool popFrontPath(uint8_t *path, uint16_t &size, Location &loc);
   void markSeen();
+  void markWithin(Location center, uint8_t radius, uint8_t *cells) const;
+  
+  // maze helpers
+  bool isWall(int x, int y) const;
+  int adjacentWallCount(int x, int y) const;
+  int adjacentWallCount(Location loc) const;
+  bool hasDiagonalOnlyNeighbor(Location loc) const;
+  bool leadsToJunction(Location from, Location prev) const;
   bool isInnerEdgeCell(Location loc) const;
   bool isCorridorWall(Location loc) const;
+
+  // inlines
+  uint8_t encode(Location loc) const { return (uint8_t)(loc.y * _width + loc.x); }
+  Location decode(uint8_t cell) const { return {(int)(cell % _width), (int)(cell / _width)}; }
+  bool isAdjacent(Location a, Location b) { return isInBounds(a) && isInBounds(b) && abs(a.x-b.x)+abs(a.y-b.y)==1; }
+  bool isWall(Location loc) const { return isWall(loc.x, loc.y); }
+  bool isInBounds(int x, int y) const { return x >= 0 && x < _width && y >= 0 && y < _height; }
+  bool isInBounds(Location loc) const { return isInBounds(loc.x, loc.y); }
+  bool isJunction(Location loc) const { return !isWall(loc) && adjacentPassageCount(loc) >= 3; }
+  bool isVisited(uint8_t cell) const { return (_runnerVisited[cell >> 3] & (uint8_t)(1U << (cell & 7))) != 0; }
+  int adjacentPassageCount(Location loc) const { return 4 - adjacentWallCount(loc); }
 };
 
 inline void MazeRunner::init()
@@ -320,42 +298,6 @@ inline void MazeRunner::init()
   placeSentry();
   markSeen();
 
-  drawMaze();
-}
-
-// Decides, from how the previous maze ended, whether the runner's start carries over. Only
-// runs when a new maze is generated; a catch restarts the same maze via retryRound() instead.
-// This is a separate step (not part of generateMaze/placeRunner) because it must run before
-// anything is regenerated: placeExit() overwrites _exitLoc, and both generateMaze() and
-// placeRunner() need the answer.
-//
-// After this call, isInBounds(_runnerLoc) means "start where the runner finished last round,
-// i.e. at the old exit". Otherwise _runnerLoc is NullLocation (outer-wall mode) and a new
-// start is picked.
-inline void MazeRunner::resolveStartFromLastRound()
-{
-  bool reachedExit = _exitLoc != NullLocation && _runnerLoc == _exitLoc;
-  if (!reachedExit && _options.outerWalls)
-    _runnerLoc = NullLocation;
-}
-
-// Restarts the current maze after a catch: runner and sentry go back to where they began, the
-// walls and exit stay put. The runner keeps its explored-cell memory (_runnerVisited), so with
-// perfectVision off it gets to learn the maze over repeated attempts.
-inline void MazeRunner::retryRound()
-{
-  log_d("Retrying maze");
-  _runnerCaught = false;
-  _runnerKnownSentryLoc = NullLocation;
-  _runnerFleeTarget = NullLocation;
-  _runnerFleeWait = 0;
-  _runnerLoc = _runnerSpawnLoc;
-  clearSearchPath();
-  _runnerCooldown = 0;
-  _sentryLoc = _sentrySpawnLoc;
-  _sentryCooldown = _options.sentrySpeed;
-  _sentryKnownRunnerLoc = NullLocation;
-  _sentryPrevLoc = NullLocation;
   drawMaze();
 }
 
@@ -408,304 +350,6 @@ inline bool MazeRunner::update()
   return changed;
 }
 
-inline bool MazeRunner::moveRunner()
-{
-  if (_runnerCooldown) { --_runnerCooldown; return false; }
-
-  if (!_options.perfectVision)
-  {
-    markSeen();
-    _searchPathSize = 0;
-  }
-
-  const uint8_t sense = _options.runnerSense;
-  const uint8_t lookout = sense > _options.sentrySense ? sense : _options.sentrySense;
-  uint16_t sentryDistance = 0;
-
-  if (_sentryActive)
-  {
-    if (!findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation,
-                  lookout, sentryDistance))
-      sentryDistance = 0;
-
-    _searchPathSize = 0;
-  }
-
-  // If the sentry is visible, remember its current location and flee again.
-  const bool sentrySeen = sentryDistance > 0 && sentryDistance <= sense;
-  if (sentrySeen)
-  {
-    _runnerKnownSentryLoc = _sentryLoc;
-    _runnerFleeWait = 0;
-  }
-
-  // Measure distance to the last-known sentry location.
-  uint16_t knownSentryDistance = 0;
-  bool hasKnownSentry = _runnerKnownSentryLoc != NullLocation;
-
-  if (hasKnownSentry)
-  {
-    if (!findPath(GoalCell, _runnerLoc, _runnerKnownSentryLoc, NullLocation,
-                  NoDepthLimit, knownSentryDistance))
-    {
-      _runnerKnownSentryLoc = NullLocation;
-      _runnerFleeWait = 0;
-      hasKnownSentry = false;
-    }
-    _searchPathSize = 0;
-  }
-
-  // Continue fleeing while the sentry is visible or the runner is still too close.
-  const bool fleeing = sentrySeen ||
-    (hasKnownSentry && knownSentryDistance < _options.runnerFear);
-
-  if (fleeing && hasKnownSentry && _runnerFleeWait == 0)
-  {
-    // Keep the current flee destination instead of picking a new one every move.
-    bool targetValid = isInBounds(_runnerFleeTarget) &&
-      findPath(GoalCell, _runnerLoc, _runnerFleeTarget, NullLocation,
-               NoDepthLimit, _searchPathSize) &&
-      _searchPathSize > 0;
-
-    if (!targetValid)
-    {
-      _runnerFleeTarget = NullLocation;
-
-      uint16_t reach = (uint16_t)sense + _options.runnerFear;
-      if (findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
-                   reach > 255 ? 255 : (uint8_t)reach, _searchPathSize,
-                   knownSentryDistance > 0 ? (uint8_t)(knownSentryDistance - 1) : 0))
-      {
-        _runnerFleeTarget = decode(_searchPath[_searchPathSize - 1]);
-      }
-    }
-
-    // If no safe move exists, wait without resetting the timer every turn.
-    if (_searchPathSize == 0)
-    {
-      _runnerFleeWait = knownSentryDistance < _options.runnerFear
-        ? _options.runnerFear - knownSentryDistance : 0;
-    }
-  }
-
-  // Wait one runner move cycle at a time before resuming normal planning.
-  if (!sentrySeen && _runnerFleeWait > 0)
-  {
-    --_runnerFleeWait;
-    return false;
-  }
-
-  if (!fleeing || _searchPathSize == 0)
-  {
-    if (hasKnownSentry && knownSentryDistance >= _options.runnerFear)
-    {
-      _runnerKnownSentryLoc = NullLocation;
-      _runnerFleeTarget = NullLocation;
-      _runnerFleeWait = 0;
-    }
-
-    // If the exit is nearby, head for it instead of walking past to explore.
-    if (!findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
-                  sense, _searchPathSize))
-    {
-      if (!_options.perfectVision)
-        findPath(GoalUnvisited, _runnerLoc, NullLocation, NullLocation,
-                 NoDepthLimit, _searchPathSize);
-
-      if (_searchPathSize == 0)
-        findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
-                 NoDepthLimit, _searchPathSize);
-    }
-  }
-
-  // Move
-  Location next;
-  if (popFrontPath(_searchPath, _searchPathSize, next))
-  {
-    Location prev = _runnerLoc;
-    _runnerLoc = next;
-    if (!_options.perfectVision) markSeen();
-    _runnerCooldown = _sentryActive ? _options.runnerSpeed : 0;
-    log_v("Moved runner from (%d,%d) to (%d,%d)",
-          prev.x, prev.y, _runnerLoc.x, _runnerLoc.y);
-    return true;
-  }
-
-  return false;
-}
-
-inline bool MazeRunner::moveSentry()
-{
-  if (!_sentryActive) return false;
-  if (_sentryCooldown) { --_sentryCooldown; return false; }
-
-  // Behaviors:
-  //  - pursue: chase the runner while it is within sensing range, then keep heading for the
-  //    last place it was seen.
-  //  - patrol (MazeOptions::sentryPatrol): once the last-seen spot is reached, or can't be
-  //    reached, walk from junction to junction (see sentryPatrol()). Without the option the
-  //    sentry walks back to its post and waits there for another sighting.
-  // _searchPath doubles as scratch space for the sentry's searches, so the runner's plan is
-  // discarded (_searchPathSize = 0) and it replans on its next turn.
-  uint16_t pathSize = 0;
-  Location next = NullLocation;
-
-  bool seesRunner = findPath(GoalCell, _sentryLoc, _runnerLoc, NullLocation,
-                             _options.sentrySense, pathSize) && pathSize > 0;
-  if (seesRunner)
-  {
-    _sentryKnownRunnerLoc = _runnerLoc;
-    next = decode(_searchPath[0]);
-  }
-  else if (isInBounds(_sentryKnownRunnerLoc) && _sentryKnownRunnerLoc != _sentryLoc &&
-           findPath(GoalCell, _sentryLoc, _sentryKnownRunnerLoc, NullLocation,
-                    NoDepthLimit, pathSize) && pathSize > 0)
-  {
-    // Recalculated one step at a time so the sentry doesn't need a second full-size path buffer.
-    next = decode(_searchPath[0]);
-  }
-  else
-  {
-    // Nothing to pursue (never saw the runner, reached the last-seen spot, or it's unreachable).
-    _sentryKnownRunnerLoc = NullLocation;
-    if (_options.sentryPatrol) next = sentryPatrol();
-    // Parking wherever the runner was last seen can leave the only route inside sensing range,
-    // so the runner would wait forever; placeSentry() chose the post so that it doesn't.
-    else if (_sentryLoc != _sentrySpawnLoc &&
-             findPath(GoalCell, _sentryLoc, _sentrySpawnLoc, NullLocation, NoDepthLimit,
-                      pathSize) && pathSize > 0)
-      next = decode(_searchPath[0]);
-  }
-
-  // The sentry's searches used the runner's buffer. The runner must replan next turn.
-  _searchPathSize = 0;
-
-  if (next == NullLocation) return false;
-
-  // Without patrol, don't let the sentry park on a choke point that cuts off the exit. (Patrol
-  // mode skips this: the sentry spawns on one and keeps moving, so it never stays there.)
-  if (!_options.sentryPatrol)
-  {
-    bool escapeExists = true;
-    if (next != _runnerLoc)
-    {
-      uint16_t escapeSize = 0;
-      escapeExists = findPath(GoalCell, _runnerLoc, _exitLoc, next, NoDepthLimit, escapeSize);
-    }
-    if (!escapeExists)
-    {
-      _sentryCooldown = _options.sentrySpeed;
-      return false;
-    }
-  }
-
-  Location prev = _sentryLoc;
-  _sentryLoc = next;
-  _sentryPrevLoc = prev;
-  _sentryCooldown = _options.sentrySpeed;
-
-  // If the sentry reached the last-seen location but the runner is gone, it has lost the trail:
-  // forget the heading too, so patrol starts by going to the nearest junction.
-  if (_sentryLoc == _sentryKnownRunnerLoc && _sentryLoc != _runnerLoc)
-  {
-    _sentryKnownRunnerLoc = NullLocation;
-    _sentryPrevLoc = NullLocation;
-  }
-
-  log_v("Moved sentry from (%d,%d) to (%d,%d)", prev.x, prev.y, _sentryLoc.x, _sentryLoc.y);
-  return true;
-}
-
-// Patrol: the next cell for the sentry, or NullLocation if it can't move.
-//  - At a junction: pick an exit (chooseJunctionPath).
-//  - In a corridor with a heading: keep going forward.
-//  - No heading (just spawned or lost the runner) or stuck in a dead end: go to the nearest
-//    junction.
-//  - No junction anywhere: wander, preferring not to backtrack.
-inline Location MazeRunner::sentryPatrol()
-{
-  if (isJunction(_sentryLoc)) return chooseJunctionPath();
-
-  if (isInBounds(_sentryPrevLoc))
-  {
-    for (int i = 0; i < 4; ++i)
-    {
-      Location next = _sentryLoc + Directions[i];
-      if (isInBounds(next) && !isWall(next) && next != _sentryPrevLoc) return next;
-    }
-    // Dead end: fall through and head for the nearest junction (which is back the way we came).
-  }
-
-  uint16_t pathSize = 0;
-  if (findPath(GoalJunction, _sentryLoc, NullLocation, NullLocation, NoDepthLimit, pathSize))
-    return decode(_searchPath[0]);
-
-  Direction steps[4] = {Left, Right, Up, Down};
-  shuffle(steps, 4);
-  Location fallback = NullLocation;
-  for (int i = 0; i < 4; ++i)
-  {
-    Location next = _sentryLoc + steps[i];
-    if (!isInBounds(next) || isWall(next)) continue;
-    if (next != _sentryPrevLoc) return next;
-    fallback = next;
-  }
-  return fallback;
-}
-
-// At a junction, picks which way to go. Each open direction is scored: avoiding a dead end
-// outranks avoiding backtracking, and ties are broken randomly (steps is shuffled, strict >
-// keeps the first best).
-//   3: onward, leads to another junction     1: onward, dead-ends
-//   2: back the way we came, leads to one    0: back the way we came, dead-ends
-inline Location MazeRunner::chooseJunctionPath()
-{
-  Direction steps[4] = {Left, Right, Up, Down};
-  shuffle(steps, 4);
-  Location best = NullLocation;
-  int bestScore = -1;
-  for (int i = 0; i < 4; ++i)
-  {
-    Location next = _sentryLoc + steps[i];
-    if (!isInBounds(next) || isWall(next)) continue;
-    int score = (next != _sentryPrevLoc ? 2 : 0) + (leadsToJunction(next, _sentryLoc) ? 1 : 0);
-    if (score > bestScore)
-    {
-      bestScore = score;
-      best = next;
-    }
-  }
-  return best;
-}
-
-// Follows the corridor that starts at `cur` (entered from `prev`) and reports whether it reaches
-// a junction (true) or ends in a dead end (false). Only corridor stubs count as dead ends: a
-// branch that forks further on is fine even if every fork eventually dead-ends, since the maze
-// is nearly a tree and every route ends somewhere.
-inline bool MazeRunner::leadsToJunction(Location cur, Location prev) const
-{
-  for (uint16_t steps = 0; steps < MAZE_MAX_CELLS; ++steps)
-  {
-    if (isJunction(cur)) return true;
-    Location next = NullLocation;
-    for (int i = 0; i < 4; ++i)
-    {
-      Location n = cur + Directions[i];
-      if (isInBounds(n) && !isWall(n) && n != prev) { next = n; break; }
-    }
-    if (next == NullLocation) return false;
-    prev = cur;
-    cur = next;
-  }
-  return true; // a loop with no junction and no dead end
-}
-
-// Open (in-bounds, non-wall) orthogonal neighbors. A junction has 3 or more.
-inline int MazeRunner::openNeighborCount(Location loc) const
-{
-  return 4 - getAdjacentWallAndBorderCount(loc);
-}
-
 inline void MazeRunner::drawMaze()
 {
   if (!_drawPixel) return;
@@ -732,8 +376,6 @@ inline void MazeRunner::drawMaze()
 inline void MazeRunner::generateMaze()
 {
   log_d("Starting maze generation");
-  for (int y = 0; y < _height; ++y)
-    for (int x = 0; x < _width; ++x) setWall(x, y, true);
 
   // Can the generator dig this cell open? With outerWalls, the perimeter is
   // reserved for the entrance and exit.
@@ -744,6 +386,16 @@ inline void MazeRunner::generateMaze()
     return loc.x > 0 && loc.x < _width - 1 &&
            loc.y > 0 && loc.y < _height - 1;
   };
+  auto setWall = [this](int x, int y, bool wall) -> void
+  {
+    uint16_t cell = (uint16_t)y * _width + x;
+    uint8_t mask = (uint8_t)(1U << (cell & 7));
+    if (wall) _mazeWalls[cell >> 3] |= mask;
+    else _mazeWalls[cell >> 3] &= (uint8_t)~mask;
+  };
+
+  for (int y = 0; y < _height; ++y)
+    for (int x = 0; x < _width; ++x) setWall(x, y, true);
 
   Location start;
 
@@ -838,7 +490,7 @@ inline void MazeRunner::generateMaze()
     {
       Location next = cur + steps[i];
       if (isCarvable(next) && isWall(next) &&
-          getAdjacentWallAndBorderCount(next) >= 3 &&
+          adjacentWallCount(next) >= 3 &&
           !(_options.preventDiagonalTouching && hasDiagonalOnlyNeighbor(next)))
       {
         setWall(next.x, next.y, false);
@@ -916,11 +568,173 @@ inline void MazeRunner::generateMaze()
       _exitLoc = finish;
     }
 
-    clearSearchPath();
+    _searchPathSize = 0;
     log_d("Maze generation complete; start (%d,%d), exit (%d,%d)",
           _runnerLoc.x, _runnerLoc.y, _exitLoc.x, _exitLoc.y);
 }
 
+
+inline bool MazeRunner::moveRunner()
+{
+  if (_runnerCooldown) { --_runnerCooldown; return false; }
+
+  if (!_options.perfectVision)
+  {
+    markSeen();
+    _searchPathSize = 0;
+  }
+
+  const uint8_t sense = _options.runnerSense;
+  const uint8_t lookout = sense > _options.sentrySense ? sense : _options.sentrySense;
+  uint16_t sentryDistance = 0;
+
+  if (_sentryActive)
+  {
+    if (!findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation,
+                  lookout, sentryDistance))
+      sentryDistance = 0;
+
+    _searchPathSize = 0;
+  }
+
+  // If the sentry is visible, remember its current location and flee again.
+  const bool sentrySeen = sentryDistance > 0 && sentryDistance <= sense;
+  if (sentrySeen)
+  {
+    _runnerKnownSentryLoc = _sentryLoc;
+    _runnerFleeWait = 0;
+  }
+
+  // Measure distance to the last-known sentry location.
+  uint16_t knownSentryDistance = 0;
+  bool hasKnownSentry = _runnerKnownSentryLoc != NullLocation;
+
+  if (hasKnownSentry)
+  {
+    if (!findPath(GoalCell, _runnerLoc, _runnerKnownSentryLoc, NullLocation,
+                  NoDepthLimit, knownSentryDistance))
+    {
+      _runnerKnownSentryLoc = NullLocation;
+      _runnerFleeWait = 0;
+      hasKnownSentry = false;
+    }
+    _searchPathSize = 0;
+  }
+
+  // Continue fleeing while the sentry is visible or the runner is still too close.
+  const bool fleeing = sentrySeen ||
+    (hasKnownSentry && knownSentryDistance < _options.runnerFear);
+
+  if (fleeing && hasKnownSentry && _runnerFleeWait == 0)
+  {
+    // Keep the current flee destination instead of picking a new one every move.
+    bool targetValid = isInBounds(_runnerFleeTarget) &&
+      findPath(GoalCell, _runnerLoc, _runnerFleeTarget, NullLocation,
+               NoDepthLimit, _searchPathSize) && _searchPathSize > 0;
+
+    if (!targetValid)
+    {
+      _runnerFleeTarget = NullLocation;
+
+      uint16_t reach = (uint16_t)sense + _options.runnerFear;
+      if (findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
+                   reach > 255 ? 255 : (uint8_t)reach, _searchPathSize,
+                   knownSentryDistance > 0 ? (uint8_t)(knownSentryDistance - 1) : 0))
+      {
+        _runnerFleeTarget = decode(_searchPath[_searchPathSize - 1]);
+      }
+    }
+
+    // If no safe move exists, wait without resetting the timer every turn.
+    if (_searchPathSize == 0)
+    {
+      _runnerKnownSentryLoc = NullLocation; // forget about sentry after wait
+      _runnerFleeWait = knownSentryDistance < _options.runnerFear
+        ? _options.runnerFear - knownSentryDistance : 0;
+    }
+  }
+
+  // Wait one runner move cycle at a time before resuming normal planning.
+  if (!sentrySeen && _runnerFleeWait > 0)
+  {
+    --_runnerFleeWait;
+    return false;
+  }
+
+  if (!fleeing || _searchPathSize == 0)
+  {
+    if (hasKnownSentry && knownSentryDistance >= _options.runnerFear)
+    {
+      _runnerKnownSentryLoc = NullLocation;
+      _runnerFleeTarget = NullLocation;
+      _runnerFleeWait = 0;
+    }
+
+    // If the exit is nearby, head for it instead of walking past to explore.
+    if (!findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
+                  sense, _searchPathSize))
+    {
+      if (!_options.perfectVision)
+        findPath(GoalUnvisited, _runnerLoc, NullLocation, NullLocation,
+                 NoDepthLimit, _searchPathSize);
+
+      if (_searchPathSize == 0)
+        findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
+                 NoDepthLimit, _searchPathSize);
+    }
+  }
+
+  // Move
+  Location next;
+  if (popFrontPath(_searchPath, _searchPathSize, next))
+  {
+    Location prev = _runnerLoc;
+    _runnerLoc = next;
+    if (!_options.perfectVision) markSeen();
+    _runnerCooldown = _sentryActive ? _options.runnerSpeed : 0;
+    log_v("Moved runner from (%d,%d) to (%d,%d)",
+          prev.x, prev.y, _runnerLoc.x, _runnerLoc.y);
+    return true;
+  }
+
+  return false;
+}
+
+// Decides, from how the previous maze ended, whether the runner's start carries over. Only
+// runs when a new maze is generated; a catch restarts the same maze via retryRound() instead.
+// This is a separate step (not part of generateMaze/placeRunner) because it must run before
+// anything is regenerated: placeExit() overwrites _exitLoc, and both generateMaze() and
+// placeRunner() need the answer.
+//
+// After this call, isInBounds(_runnerLoc) means "start where the runner finished last round,
+// i.e. at the old exit". Otherwise _runnerLoc is NullLocation (outer-wall mode) and a new
+// start is picked.
+inline void MazeRunner::resolveStartFromLastRound()
+{
+  bool reachedExit = _exitLoc != NullLocation && _runnerLoc == _exitLoc;
+  if (!reachedExit && _options.outerWalls)
+    _runnerLoc = NullLocation;
+}
+
+// Restarts the current maze after a catch: runner and sentry go back to where they began, the
+// walls and exit stay put. The runner keeps its explored-cell memory (_runnerVisited), so with
+// perfectVision off it gets to learn the maze over repeated attempts.
+inline void MazeRunner::retryRound()
+{
+  log_d("Retrying maze");
+  _runnerCaught = false;
+  _runnerKnownSentryLoc = NullLocation;
+  _runnerFleeTarget = NullLocation;
+  _runnerFleeWait = 0;
+  _runnerLoc = _runnerSpawnLoc;
+  _searchPathSize = 0;
+  _runnerCooldown = 0;
+  _sentryLoc = _sentrySpawnLoc;
+  _sentryCooldown = _options.sentrySpeed;
+  _sentryKnownRunnerLoc = NullLocation;
+  _sentryPrevLoc = NullLocation;
+  drawMaze();
+}
 
 inline void MazeRunner::placeSentry()
 {
@@ -992,6 +806,148 @@ inline void MazeRunner::placeSentry()
   }
   _sentrySpawnLoc = _sentryLoc;
   log_d("Placing sentry at (%d,%d) after %d attempts", _sentryLoc.x, _sentryLoc.y, attempts);
+}
+
+inline bool MazeRunner::moveSentry()
+{
+  if (!_sentryActive) return false;
+  if (_sentryCooldown) { --_sentryCooldown; return false; }
+
+  // Behaviors:
+  //  - pursue: chase the runner while it is within sensing range, then keep heading for the
+  //    last place it was seen.
+  //  - patrol (MazeOptions::sentryPatrol): once the last-seen spot is reached, or can't be
+  //    reached, walk from junction to junction (see sentryPatrol()). Without the option the
+  //    sentry walks back to its post and waits there for another sighting.
+  // _searchPath doubles as scratch space for the sentry's searches, so the runner's plan is
+  // discarded (_searchPathSize = 0) and it replans on its next turn.
+  uint16_t pathSize = 0;
+  Location next = NullLocation;
+
+  bool seesRunner = findPath(GoalCell, _sentryLoc, _runnerLoc, NullLocation,
+                             _options.sentrySense, pathSize) && pathSize > 0;
+  if (seesRunner)
+  {
+    _sentryKnownRunnerLoc = _runnerLoc;
+    next = decode(_searchPath[0]);
+  }
+  else if (isInBounds(_sentryKnownRunnerLoc) && _sentryKnownRunnerLoc != _sentryLoc &&
+           findPath(GoalCell, _sentryLoc, _sentryKnownRunnerLoc, NullLocation,
+                    NoDepthLimit, pathSize) && pathSize > 0)
+  {
+    // Recalculated one step at a time so the sentry doesn't need a second full-size path buffer.
+    // TODO: sentry doesn't need a full path buffer? just one big enough for its sense path?
+    next = decode(_searchPath[0]);
+  }
+  else
+  {
+    // Nothing to pursue (never saw the runner, reached the last-seen spot, or it's unreachable).
+    _sentryKnownRunnerLoc = NullLocation;
+    if (_options.sentryPatrol) next = sentryPatrol();
+    // Parking wherever the runner was last seen can leave the only route inside sensing range,
+    // so the runner would wait forever; placeSentry() chose the post so that it doesn't.
+    else if (_sentryLoc != _sentrySpawnLoc &&
+             findPath(GoalCell, _sentryLoc, _sentrySpawnLoc, NullLocation, NoDepthLimit,
+                      pathSize) && pathSize > 0)
+      next = decode(_searchPath[0]);
+  }
+  // TODO: hacky maintaining this, use light abstraction to handle shared path data?
+  _searchPathSize = 0;
+
+  if (next == NullLocation) return false;
+
+  // Without patrol, don't let the sentry park on a choke point that cuts off the exit. (Patrol
+  // mode skips this: the sentry spawns on one and keeps moving, so it never stays there.)
+  if (!_options.sentryPatrol)
+  {
+    bool escapeExists = true;
+    if (next != _runnerLoc)
+    {
+      uint16_t escapeSize = 0;
+      escapeExists = findPath(GoalCell, _runnerLoc, _exitLoc, next, NoDepthLimit, escapeSize);
+    }
+    if (!escapeExists)
+    {
+      _sentryCooldown = _options.sentrySpeed;
+      return false;
+    }
+  }
+
+  Location prev = _sentryLoc;
+  _sentryLoc = next;
+  _sentryPrevLoc = prev;
+  _sentryCooldown = _options.sentrySpeed;
+
+  // Sentry lost trail of runner
+  if (_sentryLoc == _sentryKnownRunnerLoc && _sentryLoc != _runnerLoc)
+  {
+    _sentryKnownRunnerLoc = NullLocation;
+  }
+
+  log_v("Moved sentry from (%d,%d) to (%d,%d)", prev.x, prev.y, _sentryLoc.x, _sentryLoc.y);
+  return true;
+}
+
+// Patrol: the next cell for the sentry, or NullLocation if it can't move.
+//  - At a junction: pick an exit (chooseJunctionPath).
+//  - In a corridor with a heading: keep going forward.
+//  - No heading (just spawned or lost the runner) or stuck in a dead end: go to the nearest
+//    junction.
+//  - No junction anywhere: wander, preferring not to backtrack.
+inline Location MazeRunner::sentryPatrol()
+{
+  if (isJunction(_sentryLoc)) return chooseJunctionPath();
+
+  if (isInBounds(_sentryPrevLoc))
+  {
+    for (int i = 0; i < 4; ++i)
+    {
+      Location next = _sentryLoc + Directions[i];
+      if (isInBounds(next) && !isWall(next) && next != _sentryPrevLoc) return next;
+    }
+    // Dead end: fall through and head for the nearest junction (which is back the way we came).
+  }
+
+  uint16_t pathSize = 0;
+  if (findPath(GoalJunction, _sentryLoc, NullLocation, NullLocation, NoDepthLimit, pathSize))
+    return decode(_searchPath[0]);
+
+  Direction steps[4] = {Left, Right, Up, Down};
+  shuffle(steps, 4);
+  Location fallback = NullLocation;
+  for (int i = 0; i < 4; ++i)
+  {
+    Location next = _sentryLoc + steps[i];
+    if (!isInBounds(next) || isWall(next)) continue;
+    if (next != _sentryPrevLoc) return next;
+    fallback = next;
+  }
+  return fallback;
+}
+
+// At a junction, picks which way to go. Each open direction is scored: avoiding a dead end
+// outranks avoiding backtracking, and ties are broken randomly (steps is shuffled, strict >
+// keeps the first best).
+//   3: onward, leads to another junction     1: onward, dead-ends
+//   2: back the way we came, leads to one    0: back the way we came, dead-ends
+inline Location MazeRunner::chooseJunctionPath()
+{
+  Direction steps[4] = {Left, Right, Up, Down};
+  shuffle(steps, 4);
+  Location best = NullLocation;
+  int bestScore = -1;
+  for (int i = 0; i < 4; ++i)
+  {
+    Location next = _sentryLoc + steps[i];
+    if (!isInBounds(next) || isWall(next)) continue;
+    int score = (leadsToJunction(next, _sentryLoc) ? 2 : 0) + (next != _sentryPrevLoc ? 1 : 0);
+    if (score > bestScore)
+    {
+      bestScore = score;
+      best = next;
+    }
+  }
+  return best;
 }
 
 // Breadth-first search over open cells from `start`, never entering a cell within avoidRadius
@@ -1079,6 +1035,50 @@ inline bool MazeRunner::findPath(SearchGoal goal, Location start, Location targe
   return true;
 }
 
+inline bool MazeRunner::appendPath(uint8_t *path, uint16_t &size, uint8_t cell)
+{
+  if (size >= MAZE_MAX_CELLS) return false;
+  path[size++] = cell;
+  return true;
+}
+
+inline bool MazeRunner::popFrontPath(uint8_t *path, uint16_t &size, Location &loc)
+{
+  if (!size) return false;
+  loc = decode(path[0]);
+  for (uint16_t i = 1; i < size; ++i) path[i - 1] = path[i];
+  --size;
+  return true;
+}
+
+// Exploring mode: the runner sees up to runnerSense cells away. With seeAroundCorners that is any
+// open cell within that many steps; otherwise only straight lines until a wall blocks the view,
+// so a dead end off to the side still has to be walked into.
+inline void MazeRunner::markSeen()
+{
+  if (!isInBounds(_runnerLoc)) return;
+  if (_options.seeAroundCorners)
+  {
+    uint8_t seen[MAZE_BITSET_BYTES] = {};
+    markWithin(_runnerLoc, _options.runnerSense, seen);
+    for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] |= seen[i];
+    return;
+  }
+  uint8_t cell = encode(_runnerLoc);
+  _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
+  for (uint8_t dir = 0; dir < 4; ++dir)
+  {
+    Location loc = _runnerLoc;
+    for (uint8_t step = 0; step < _options.runnerSense; ++step)
+    {
+      loc += Directions[dir];
+      if (!isInBounds(loc) || isWall(loc)) break;
+      cell = encode(loc);
+      _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
+    }
+  }
+}
+
 // Marks every open cell within `radius` steps of `center` in `cells`, which must start without
 // any of them marked (it doubles as the search's visited set). Uses a local queue rather than
 // _searchPath, so it never disturbs the runner's plan.
@@ -1110,40 +1110,13 @@ inline void MazeRunner::markWithin(Location center, uint8_t radius, uint8_t *cel
   }
 }
 
-// Exploring mode: the runner sees up to runnerSense cells away. With seeAroundCorners that is any
-// open cell within that many steps; otherwise only straight lines until a wall blocks the view,
-// so a dead end off to the side still has to be walked into.
-inline void MazeRunner::markSeen()
+inline bool MazeRunner::isWall(int x, int y) const
 {
-  if (!isInBounds(_runnerLoc)) return;
-  if (_options.seeAroundCorners)
-  {
-    uint8_t seen[MAZE_BITSET_BYTES] = {};
-    markWithin(_runnerLoc, _options.runnerSense, seen);
-    for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] |= seen[i];
-    return;
-  }
-  uint8_t cell = encode(_runnerLoc);
-  _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
-  for (uint8_t dir = 0; dir < 4; ++dir)
-  {
-    Location loc = _runnerLoc;
-    for (uint8_t step = 0; step < _options.runnerSense; ++step)
-    {
-      loc += Directions[dir];
-      if (!isInBounds(loc) || isWall(loc)) break;
-      cell = encode(loc);
-      _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
-    }
-  }
+  uint16_t cell = (uint16_t)y * _width + x;
+  return (_mazeWalls[cell >> 3] & (uint8_t)(1U << (cell & 7))) != 0;
 }
 
-inline bool MazeRunner::isWall(int x, int y) const { return wallAt(x, y); }
-inline bool MazeRunner::isWall(Location loc) const { return isWall(loc.x, loc.y); }
-inline bool MazeRunner::isInBounds(int x, int y) const { return x >= 0 && x < _width && y >= 0 && y < _height; }
-inline bool MazeRunner::isInBounds(Location loc) const { return isInBounds(loc.x, loc.y); }
-
-inline int MazeRunner::getAdjacentWallAndBorderCount(int x, int y) const
+inline int MazeRunner::adjacentWallCount(int x, int y) const
 {
   int count = 0;
   for (int i=0; i<4; ++i)
@@ -1153,9 +1126,10 @@ inline int MazeRunner::getAdjacentWallAndBorderCount(int x, int y) const
   }
   return count;
 }
-inline int MazeRunner::getAdjacentWallAndBorderCount(Location loc) const
+
+inline int MazeRunner::adjacentWallCount(Location loc) const
 {
-  return getAdjacentWallAndBorderCount(loc.x, loc.y);
+  return adjacentWallCount(loc.x, loc.y);
 }
 
 // True if some open diagonal neighbor touches this cell only at a corner, i.e. both cells
@@ -1199,4 +1173,26 @@ inline bool MazeRunner::isCorridorWall(Location loc) const
        isWall(loc + Left) &&  isWall(loc + Right);
 
   return horizontal || vertical;
+}
+
+// Follows the corridor that starts at `cur` (entered from `prev`) and reports whether it reaches
+// a junction (true) or ends in a dead end (false). Only corridor stubs count as dead ends: a
+// branch that forks further on is fine even if every fork eventually dead-ends, since the maze
+// is nearly a tree and every route ends somewhere.
+inline bool MazeRunner::leadsToJunction(Location cur, Location prev) const
+{
+  for (uint16_t steps = 0; steps < MAZE_MAX_CELLS; ++steps)
+  {
+    if (isJunction(cur)) return true;
+    Location next = NullLocation;
+    for (int i = 0; i < 4; ++i)
+    {
+      Location n = cur + Directions[i];
+      if (isInBounds(n) && !isWall(n) && n != prev) { next = n; break; }
+    }
+    if (next == NullLocation) return false;
+    prev = cur;
+    cur = next;
+  }
+  return true; // a loop with no junction and no dead end
 }
