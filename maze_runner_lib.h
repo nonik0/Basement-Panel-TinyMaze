@@ -158,6 +158,7 @@ private:
   // runner state
   Location _runnerLoc = NullLocation;
   Location _runnerKnownSentryLoc = NullLocation;
+  Location _runnerFleeTarget = NullLocation;
   Location _runnerSpawnLoc = NullLocation;
   uint8_t _runnerFleeWait = 0;
   bool _runnerCaught = false;
@@ -182,7 +183,7 @@ private:
   DrawPixelCallback _drawPixel;
   StatusCallback _setStatus;
 
-  uint8_t toLocIndex(Location loc) const { return (uint8_t)(loc.y * _width + loc.x); }
+  uint8_t encode(Location loc) const { return (uint8_t)(loc.y * _width + loc.x); }
   Location decode(uint8_t cell) const { return {(int)(cell % _width), (int)(cell / _width)}; }
   bool wallAt(int x, int y) const
   {
@@ -310,6 +311,7 @@ inline void MazeRunner::init()
   for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] = 0;
   // TODO hate how these are set manually here
   _runnerKnownSentryLoc = NullLocation;
+  _runnerFleeTarget = NullLocation;
   _runnerCaught = false;
   _runnerFleeWait = 0;
   _roundFrames = 0;
@@ -345,6 +347,7 @@ inline void MazeRunner::retryRound()
   log_d("Retrying maze");
   _runnerCaught = false;
   _runnerKnownSentryLoc = NullLocation;
+  _runnerFleeTarget = NullLocation;
   _runnerFleeWait = 0;
   _runnerLoc = _runnerSpawnLoc;
   clearSearchPath();
@@ -456,14 +459,28 @@ inline bool MazeRunner::moveRunner()
   const bool fleeing = sentrySeen ||
     (hasKnownSentry && knownSentryDistance < _options.runnerFear);
 
-  if (fleeing && hasKnownSentry)
+  if (fleeing && hasKnownSentry && _runnerFleeWait == 0)
   {
-    uint16_t reach = (uint16_t)sense + _options.runnerFear;
-    findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
-             reach > 255 ? 255 : (uint8_t)reach, _searchPathSize,
-             knownSentryDistance > 0 ? (uint8_t)(knownSentryDistance - 1) : 0);
+    // Keep the current flee destination instead of picking a new one every move.
+    bool targetValid = isInBounds(_runnerFleeTarget) &&
+      findPath(GoalCell, _runnerLoc, _runnerFleeTarget, NullLocation,
+               NoDepthLimit, _searchPathSize) &&
+      _searchPathSize > 0;
 
-    // If no further safe move exists, wait out the remaining fear distance.
+    if (!targetValid)
+    {
+      _runnerFleeTarget = NullLocation;
+
+      uint16_t reach = (uint16_t)sense + _options.runnerFear;
+      if (findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
+                   reach > 255 ? 255 : (uint8_t)reach, _searchPathSize,
+                   knownSentryDistance > 0 ? (uint8_t)(knownSentryDistance - 1) : 0))
+      {
+        _runnerFleeTarget = decode(_searchPath[_searchPathSize - 1]);
+      }
+    }
+
+    // If no safe move exists, wait without resetting the timer every turn.
     if (_searchPathSize == 0)
     {
       _runnerFleeWait = knownSentryDistance < _options.runnerFear
@@ -481,7 +498,11 @@ inline bool MazeRunner::moveRunner()
   if (!fleeing || _searchPathSize == 0)
   {
     if (hasKnownSentry && knownSentryDistance >= _options.runnerFear)
+    {
       _runnerKnownSentryLoc = NullLocation;
+      _runnerFleeTarget = NullLocation;
+      _runnerFleeWait = 0;
+    }
 
     // If the exit is nearby, head for it instead of walking past to explore.
     if (!findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation,
@@ -647,7 +668,7 @@ inline Location MazeRunner::chooseJunctionPath()
   {
     Location next = _sentryLoc + steps[i];
     if (!isInBounds(next) || isWall(next)) continue;
-    int score = (leadsToJunction(next, _sentryLoc) ? 2 : 0) + (next != _sentryPrevLoc ? 1 : 0);
+    int score = (next != _sentryPrevLoc ? 2 : 0) + (leadsToJunction(next, _sentryLoc) ? 1 : 0);
     if (score > bestScore)
     {
       bestScore = score;
@@ -696,7 +717,7 @@ inline void MazeRunner::drawMaze()
   {
     for (int y = 0; y < _height; ++y)
       for (int x = 0; x < _width; ++x)
-        if (!isWall(x, y) && isVisited(toLocIndex({x, y})))
+        if (!isWall(x, y) && isVisited(encode({x, y})))
           _drawPixel(x, y, _options.visitedColor);
   }
   // These can legitimately be NullLocation (-1,-1): the exit when placeExit() failed, the
@@ -784,7 +805,8 @@ inline void MazeRunner::generateMaze()
   // Generate a spanning tree from the runner's start, using _searchPath as the carving stack.
   uint8_t *stackCells = _searchPath;
   uint16_t stackSize = 0;
-  stackCells[stackSize++] = toLocIndex(start);
+  stackCells[stackSize++] = encode(start);
+  Direction previous = NullLocation;
   int maxCycles = 1000;
 
   while (stackSize && maxCycles-- > 0)
@@ -792,6 +814,24 @@ inline void MazeRunner::generateMaze()
     Location cur = decode(stackCells[stackSize - 1]);
     Direction steps[4] = {Left, Right, Up, Down};
     shuffle(steps, 4);
+
+    // Sometimes prefer continuing in the direction used to enter this cell.
+    // TODO: make this a preference or random optino with each maze gen?
+    if (stackSize > 1 && random(2) == 0)
+    {
+      Location prev = decode(stackCells[stackSize - 2]);
+      Direction forward = {cur.x - prev.x, cur.y - prev.y};
+      for (int i = 0; i < 4; ++i)
+      {
+        if (steps[i] == forward)
+        {
+          Direction temp = steps[0];
+          steps[0] = steps[i];
+          steps[i] = temp;
+          break;
+        }
+      }
+    }
 
     bool found = false;
     for (int i = 0; i < 4; ++i)
@@ -803,13 +843,18 @@ inline void MazeRunner::generateMaze()
       {
         setWall(next.x, next.y, false);
         if (stackSize < MAZE_MAX_CELLS)
-          stackCells[stackSize++] = toLocIndex(next);
+          stackCells[stackSize++] = encode(next);
+        previous = steps[i];
         found = true;
         break;
       }
     }
 
-    if (!found) --stackSize;
+    if (!found)
+    {
+      --stackSize;
+      previous = NullLocation;
+    }
   }
 
   int removed = 0;
@@ -963,8 +1008,8 @@ inline bool MazeRunner::findPath(SearchGoal goal, Location start, Location targe
   uint8_t reached[MAZE_BITSET_BYTES] = {};
   uint8_t parentDir[MAZE_PARENT_BYTES] = {}; // per cell: Directions index pointing to its parent
   uint8_t *queue = _searchPath;
-  const uint8_t startId = toLocIndex(start);
-  const uint8_t targetId = goal == GoalCell ? toLocIndex(target) : startId;
+  const uint8_t startId = encode(start);
+  const uint8_t targetId = goal == GoalCell ? encode(target) : startId;
   uint16_t head = 0, tail = 0, levelEnd = 1;
   uint8_t depth = 0;
 
@@ -1000,7 +1045,7 @@ inline bool MazeRunner::findPath(SearchGoal goal, Location start, Location targe
       uint8_t dir = order[i];
       Location next = cur + Directions[dir];
       if (!isInBounds(next) || isWall(next)) continue;
-      uint8_t nid = toLocIndex(next);
+      uint8_t nid = encode(next);
       uint8_t mask = (uint8_t)(1U << (nid & 7));
       if (reached[nid >> 3] & mask) continue;
       reached[nid >> 3] |= mask;
@@ -1043,7 +1088,7 @@ inline void MazeRunner::markWithin(Location center, uint8_t radius, uint8_t *cel
   if (radius > MAZE_MAX_SENSE) radius = MAZE_MAX_SENSE;
   uint8_t queue[MaxZoneCells];
   uint8_t head = 0, tail = 0, levelEnd = 1, depth = 0;
-  const uint8_t centerId = toLocIndex(center);
+  const uint8_t centerId = encode(center);
   queue[tail++] = centerId;
   cells[centerId >> 3] |= (uint8_t)(1U << (centerId & 7));
   while (head < tail)
@@ -1056,7 +1101,7 @@ inline void MazeRunner::markWithin(Location center, uint8_t radius, uint8_t *cel
     {
       Location next = cur + Directions[dir];
       if (!isInBounds(next) || isWall(next)) continue;
-      uint8_t nid = toLocIndex(next);
+      uint8_t nid = encode(next);
       uint8_t mask = (uint8_t)(1U << (nid & 7));
       if (cells[nid >> 3] & mask) continue;
       cells[nid >> 3] |= mask;
@@ -1078,7 +1123,7 @@ inline void MazeRunner::markSeen()
     for (uint16_t i = 0; i < MAZE_BITSET_BYTES; ++i) _runnerVisited[i] |= seen[i];
     return;
   }
-  uint8_t cell = toLocIndex(_runnerLoc);
+  uint8_t cell = encode(_runnerLoc);
   _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
   for (uint8_t dir = 0; dir < 4; ++dir)
   {
@@ -1087,7 +1132,7 @@ inline void MazeRunner::markSeen()
     {
       loc += Directions[dir];
       if (!isInBounds(loc) || isWall(loc)) break;
-      cell = toLocIndex(loc);
+      cell = encode(loc);
       _runnerVisited[cell >> 3] |= (uint8_t)(1U << (cell & 7));
     }
   }
