@@ -142,50 +142,10 @@ inline bool leftOrRight(Direction dir) { return dir == Left || dir == Right; }
 
 class MazeRunner
 {
-private:
-  static const int ErrorDelay = 30000;
-  static const uint8_t NoDepthLimit = 0;
-  static const uint8_t MaxZoneCells = 2 * MAZE_MAX_SENSE * (MAZE_MAX_SENSE + 1) + 1;
-
-  // configuration
-  int _width;
-  int _height;
-  uint32_t _pathColor, _wallColor, _runnerColor, _sentryColor, _exitColor;
-  MazeOptions _options;
-
-  // callbacks
+public:
   typedef void (*DrawPixelCallback)(int, int, uint32_t);
   typedef void (*StatusCallback)(uint32_t);
-  DrawPixelCallback _drawPixel;
-  StatusCallback _setStatus;
 
-  // maze and round state
-  uint8_t _mazeWalls[MAZE_BITSET_BYTES];
-  Location _exitLoc = NullLocation;
-  int _resetDelay = -1;
-  uint16_t _roundFrames = 0;
-  
-  // Shared path buffer used by findPath().
-  uint8_t _searchPath[MAZE_MAX_CELLS];
-
-  // runner state
-  Location _runnerLoc = NullLocation;
-  Location _runnerKnownSentryLoc = NullLocation;
-  Location _runnerFleeTarget = NullLocation;
-  Location _runnerSpawnLoc = NullLocation;
-  uint8_t _runnerFleeWait = 0;
-  bool _runnerCaught = false;
-  uint8_t _runnerCooldown = 0;
-  uint8_t _runnerVisited[MAZE_BITSET_BYTES] = {};
-  
-  // sentry state
-  bool _sentryActive = false;
-  Location _sentryLoc = NullLocation;
-  Location _sentryKnownRunnerLoc = NullLocation;
-  Location _sentryPrevLoc = NullLocation;
-  Location _sentrySpawnLoc = NullLocation;
-  uint8_t _sentryCooldown = 0;
-public:
   MazeRunner(int width, int height,
              uint32_t pathColor, uint32_t wallColor,
              uint32_t runnerColor, uint32_t sentryColor,
@@ -223,8 +183,46 @@ public:
 
   void init();
   bool update();
-
 private:
+  static const int ErrorDelay = 30000;
+  static const uint8_t NoDepthLimit = 0;
+  static const uint8_t MaxZoneCells = 2 * MAZE_MAX_SENSE * (MAZE_MAX_SENSE + 1) + 1;
+
+  // configuration
+  int _width;
+  int _height;
+  uint32_t _pathColor, _wallColor, _runnerColor, _sentryColor, _exitColor;
+  DrawPixelCallback _drawPixel;
+  StatusCallback _setStatus;
+  MazeOptions _options;
+
+  // maze and round state
+  uint8_t _mazeWalls[MAZE_BITSET_BYTES];
+  Location _exitLoc = NullLocation;
+  int _resetDelay = -1;
+  uint16_t _roundFrames = 0;
+  
+  // Shared path buffer used by findPath().
+  uint8_t _searchPath[MAZE_MAX_CELLS];
+
+  // runner state
+  Location _runnerLoc = NullLocation;
+  Location _runnerKnownSentryLoc = NullLocation;
+  Location _runnerFleeTarget = NullLocation;
+  Location _runnerSpawnLoc = NullLocation;
+  uint8_t _runnerFleeWait = 0;
+  bool _runnerCaught = false;
+  uint8_t _runnerCooldown = 0;
+  uint8_t _runnerVisited[MAZE_BITSET_BYTES] = {};
+  
+  // sentry state
+  bool _sentryActive = false;
+  Location _sentryLoc = NullLocation;
+  Location _sentryKnownRunnerLoc = NullLocation;
+  Location _sentryPrevLoc = NullLocation;
+  Location _sentrySpawnLoc = NullLocation;
+  uint8_t _sentryCooldown = 0;
+
   // maze functions
   void drawMaze();
   void generateMaze();
@@ -458,6 +456,7 @@ inline void MazeRunner::generateMaze()
   stackCells[stackSize++] = encode(start);
   Direction previous = NullLocation;
   int maxCycles = 1000;
+  uint8_t straightPreference = 2 + random(3); // the lower the more likely to prefer a straight carve
 
   while (stackSize && maxCycles-- > 0)
   {
@@ -467,7 +466,7 @@ inline void MazeRunner::generateMaze()
 
     // Sometimes prefer continuing in the direction used to enter this cell.
     // TODO: make this a preference or random optino with each maze gen?
-    if (stackSize > 1 && random(2) == 0)
+    if (stackSize > 1 && random(straightPreference) == 0)
     {
       Location prev = decode(stackCells[stackSize - 2]);
       Direction forward = {cur.x - prev.x, cur.y - prev.y};
