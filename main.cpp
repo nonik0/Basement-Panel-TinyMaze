@@ -16,7 +16,7 @@
 
 #define I2C_ADDRESS 0x14
 
-const int MAZE_DELAY_MS = 50;
+const int MAZE_DELAY_MS = 30;
 
 // Same packing as NeoPixel::Color(), which isn't constexpr: calling it here would copy every
 // color into SRAM at startup instead of leaving it in flash.
@@ -173,6 +173,9 @@ void loop()
     return;
   }
 
+  // log update at start time
+  lastMazeUpdate = millis();
+
   if (!display)
   {
     matrix.clear();
@@ -183,6 +186,4 @@ void loop()
 
   if (mazeRunner.update())
     matrix.show();
-
-  lastMazeUpdate = millis();
 }

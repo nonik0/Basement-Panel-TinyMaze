@@ -635,21 +635,29 @@ inline bool MazeRunner::moveRunner()
     // If no safe move exists, wait without resetting the timer every turn.
     if (pathSize <= 0)
     {
-      _runnerKnownSentryLoc = NullLocation; // forget about sentry after wait
+      // TODO: floor or constrain here?
       _runnerFleeWait = knownSentryDistance < _options.runnerFear
         ? _options.runnerFear - knownSentryDistance : 0;
     }
   }
-
+  
   // Wait one runner move cycle at a time before resuming normal planning.
   if (!sentrySeen && _runnerFleeWait > 0)
   {
     --_runnerFleeWait;
+
+    // forget about sentry after waiting during a flee
+    if (_runnerFleeWait == 0)
+    {
+      _runnerKnownSentryLoc = NullLocation;
+    }
+
     return false;
   }
 
   if (!fleeing || pathSize <= 0)
   {
+    // forget about sentry if not fleeing or successfully fleed and out of sight
     if (hasKnownSentry && knownSentryDistance >= _options.runnerFear)
     {
       _runnerKnownSentryLoc = NullLocation;
@@ -823,8 +831,9 @@ inline bool MazeRunner::moveSentry()
   }
   else
   {
-    // Nothing to pursue (never saw the runner, reached the last-seen spot, or it's unreachable).
+    // Sentry lost trail of runner
     _sentryKnownRunnerLoc = NullLocation;
+
     if (_options.sentryPatrol) next = sentryPatrol();
     // Parking wherever the runner was last seen can leave the only route inside sensing range,
     // so the runner would wait forever; placeSentry() chose the post so that it doesn't.
@@ -833,7 +842,6 @@ inline bool MazeRunner::moveSentry()
                                   NullLocation, NoDepthLimit)) > 0)
       next = decode(_searchPath[0]);
   }
-  // TODO: hacky maintaining this, use light abstraction to handle shared path data?
 
   if (next == NullLocation) return false;
 
@@ -858,11 +866,11 @@ inline bool MazeRunner::moveSentry()
   _sentryPrevLoc = prev;
   _sentryCooldown = _options.sentrySpeed;
 
-  // Sentry lost trail of runner
-  if (_sentryLoc == _sentryKnownRunnerLoc && _sentryLoc != _runnerLoc)
-  {
-    _sentryKnownRunnerLoc = NullLocation;
-  }
+  // // Sentry lost trail of runner
+  // if (_sentryLoc == _sentryKnownRunnerLoc && _sentryLoc != _runnerLoc)
+  // {
+  //   _sentryKnownRunnerLoc = NullLocation;
+  // }
 
   log_v("Moved sentry from (%d,%d) to (%d,%d)", prev.x, prev.y, _sentryLoc.x, _sentryLoc.y);
   return true;
