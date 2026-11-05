@@ -1,3 +1,6 @@
+// TODO: eventually expand to support larger mazes/matrices for chips with more memory, probably
+// fine to leave the static memory stuff since it's nicer to avoid heap if we can
+
 #pragma once
 
 #include <Arduino.h>
@@ -104,6 +107,10 @@ struct MazeOptions
   uint8_t runnerSpeed = 3;
   // How far past runnerSense a flee may aim.
   uint8_t runnerFear = 15;
+  // After seeing the sentry, the runner avoids exploring within dangerRadius steps of where it
+  // was seen for this many frames, waiting if nothing else is reachable. 0 disables.
+  uint16_t dangerMemory = 150;
+  uint8_t dangerRadius = 4;
 
   // --- Sentry ---
   bool sentryEnabled = true;
@@ -232,6 +239,8 @@ private:
   bool _runnerCaught = false;
   uint8_t _runnerCooldown = 0;
   uint8_t _runnerVisited[MAZE_BITSET_BYTES] = {};
+  Location _runnerDangerLoc = NullLocation; // where the sentry was last seen
+  uint16_t _runnerDangerFrames = 0;         // frames left to keep avoiding it
 
   // sentry state
   Location _sentryLoc = NullLocation;
@@ -256,6 +265,7 @@ private:
   Location sentryPatrol();
   Location chooseJunctionPath();
 
+  // TODO: not clear which ones read from state like runnerVisited?
   // pathing
   enum SearchGoal : uint8_t
   {
@@ -264,6 +274,7 @@ private:
     GoalUnvisited,         // nearest cell the runner has not explored
     GoalFarthest,          // last cell reached (farthest within the depth limit)
     GoalFarthestInnerEdge, // farthest open cell against the outer wall
+    GoalFarthestUnvisited, // farthest cell the runner has not explored (within the depth limit)
   };
   // Returns the path length, 0 for start == target, or -1 if no path was found. On success
   // _pathFirst and _pathLast hold the first step and the last cell of the route.
@@ -323,6 +334,7 @@ inline void MazeRunner::init()
   _runnerCaught = false;
   _runnerFleeWait = 0;
   _runnerCooldown = 0;
+  _runnerDangerFrames = 0;
   _roundFrames = 0;
   generateMaze();
   _runnerSpawnLoc = _runnerLoc;
@@ -592,22 +604,22 @@ inline void MazeRunner::generateMaze()
 
 inline bool MazeRunner::moveRunner()
 {
+  if (_runnerDangerFrames) --_runnerDangerFrames; 
   if (_runnerCooldown) { --_runnerCooldown; return false; }
 
-  // No markSeen() here: the runner hasn't moved since the last one (init(), the post-move call
-  // below, or retryRound() back to an already-marked spawn).
   int16_t pathSize = 0;
-  const uint8_t sense = _options.runnerSense;
 
   // Either unobstructed cardinal line of sight (cheap, so checked first) or around-corner
   // sensing can detect the sentry.
   const bool sentrySeen = _options.sentryEnabled &&
     (hasLineOfSight(_runnerLoc, _sentryLoc, _options.runnerLineOfSight) ||
-     findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation, sense) > 0);
+     findPath(GoalCell, _runnerLoc, _sentryLoc, NullLocation, _options.runnerSense) > 0);
   if (sentrySeen)
   {
     _runnerKnownSentryLoc = _sentryLoc;
     _runnerFleeWait = 0;
+    _runnerDangerLoc = _sentryLoc;
+    _runnerDangerFrames = _options.dangerMemory;
   }
 
   // Measure distance to the last-known sentry location.
@@ -647,9 +659,18 @@ inline bool MazeRunner::moveRunner()
     {
       _runnerFleeTarget = NullLocation;
 
-      uint16_t reach = (uint16_t)sense + _options.runnerFear;
-      pathSize = findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
-                          reach > 255 ? 255 : (uint8_t)reach, avoidRadius);
+      uint16_t reach = (uint16_t)_options.runnerSense + _options.runnerFear;
+      const uint8_t maxDepth = reach > 255 ? 255 : (uint8_t)reach;
+
+      // Prefer fleeing into unexplored territory (exploring while escaping, instead of
+      // retreating along known corridors); otherwise just get as far away as possible.
+      pathSize = -1;
+      if (!_options.fullVision)
+        pathSize = findPath(GoalFarthestUnvisited, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
+                            maxDepth, avoidRadius);
+      if (pathSize <= 0)
+        pathSize = findPath(GoalFarthest, _runnerLoc, NullLocation, _runnerKnownSentryLoc,
+                            maxDepth, avoidRadius);
       if (pathSize > 0)
         _runnerFleeTarget = decode(_pathLast);
     }
@@ -680,7 +701,7 @@ inline bool MazeRunner::moveRunner()
 
   if (!fleeing || pathSize <= 0)
   {
-    // forget about sentry if not fleeing or successfully fleed and out of sight
+    // forget about sentry if not fleeing or successfully fled and out of sight
     if (hasKnownSentry && knownSentryDistance >= _options.runnerFear)
     {
       _runnerKnownSentryLoc = NullLocation;
@@ -688,16 +709,28 @@ inline bool MazeRunner::moveRunner()
       _runnerFleeWait = 0;
     }
 
-    // If the exit is nearby, head for it instead of walking past to explore.
-    pathSize = findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation, sense);
+    // If the exit is in view, head for it instead of walking past to explore. In view means
+    // within around-corner sensing range, or down an unobstructed straight line.
+    if (hasLineOfSight(_runnerLoc, _exitLoc, _options.runnerLineOfSight))
+      pathSize = findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation, NoDepthLimit);
+    else
+      pathSize = findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation, _options.runnerSense);
+
     if (pathSize < 0)
     {
+      // Recently seen the sentry: don't explore back into its area. If that leaves nowhere
+      // to go, wait it out (the timer runs down) instead of walking back into it.
+      Location avoidLoc = NullLocation;
+      if (_runnerDangerFrames > 0 &&
+          abs(_runnerLoc.x - _runnerDangerLoc.x) + abs(_runnerLoc.y - _runnerDangerLoc.y) > _options.dangerRadius)
+        avoidLoc = _runnerDangerLoc;
+
       if (!_options.fullVision)
-        pathSize = findPath(GoalUnvisited, _runnerLoc, NullLocation, NullLocation,
-                            NoDepthLimit);
+        pathSize = findPath(GoalUnvisited, _runnerLoc, NullLocation, avoidLoc,
+                            NoDepthLimit, _options.dangerRadius);
 
       if (pathSize <= 0)
-        pathSize = findPath(GoalCell, _runnerLoc, _exitLoc, NullLocation, NoDepthLimit);
+        pathSize = findPath(GoalCell, _runnerLoc, _exitLoc, avoidLoc, NoDepthLimit, _options.dangerRadius);
     }
   }
 
@@ -767,6 +800,7 @@ inline void MazeRunner::retryRound()
   _runnerFleeWait = 0;
   _runnerLoc = _runnerSpawnLoc;
   _runnerCooldown = 0;
+  _runnerDangerFrames = 0;
   _sentryLoc = _sentrySpawnLoc;
   _sentryCooldown = _options.sentrySpeed;
   _sentryKnownRunnerLoc = NullLocation;
@@ -1037,6 +1071,7 @@ inline int16_t MazeRunner::findPath(SearchGoal goal, Location start, Location ta
       // BFS dequeues cells in nondecreasing distance order, so the last match is the farthest.
       case GoalFarthest: found = id; break;
       case GoalFarthestInnerEdge: if (isInnerEdgeCell(Location(cx, cy))) found = id; break;
+      case GoalFarthestUnvisited: if (!isVisited(id)) found = id; break;
     }
     if (success) { found = id; break; }
     if (maxDepth != NoDepthLimit && depth >= maxDepth) continue;
@@ -1055,7 +1090,8 @@ inline int16_t MazeRunner::findPath(SearchGoal goal, Location start, Location ta
     }
   }
 
-  if (goal == GoalFarthest || goal == GoalFarthestInnerEdge) success = found != startId;
+  if (goal == GoalFarthest || goal == GoalFarthestInnerEdge || goal == GoalFarthestUnvisited)
+    success = found != startId;
   if (!success) return -1;
 
   // Walk the parent links back to the start. That visits the route in reverse, so the last cell
